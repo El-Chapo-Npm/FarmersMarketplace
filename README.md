@@ -258,6 +258,58 @@ When skipped in CI, a warning is printed to the log so the omission is visible.
 
 A dedicated **nightly CI job** (`contract-tests-nightly` in `.github/workflows/ci.yml`) runs the full contract test suite on a schedule with Docker available, ensuring these tests are not silently broken.
 
+### Workspace contract tests
+
+The newer Soroban workspace lives in `contracts/` and is covered by the
+`soroban-contracts` CI job:
+
+```bash
+cd contracts
+cargo test -p soroban-escrow --lib
+cargo test -p creator-earnings --features testutils
+bash wasm-profile.sh
+```
+
+The CI job uploads `contracts-wasm-size-profile.txt` so release WASM size
+history is visible on every push and pull request.
+
+### Escrow migration runbook
+
+Before running an escrow schema migration, dry-run the target order IDs with the
+read-only `migrate_preview(order_ids)` contract function. The operator runbook
+is in [`docs/escrow-migration-runbook.md`](docs/escrow-migration-runbook.md).
+
+### Escrow batch resource budget
+
+`contracts/escrow/src/lib.rs` keeps `MAX_BATCH_RELEASE` at `20`. The unit test
+`max_batch_deposit_and_release_resource_budget` exercises exactly 20 entries and
+fails if the Soroban SDK budget grows beyond the CI ceilings below.
+
+| Function | Entries | Observed CPU | CPU ceiling | Observed memory | Memory ceiling |
+|---|---:|---:|---:|---:|---:|
+| `batch_deposit` | 20 | 3,206,922 | 8,000,000 | 780,020 | 2,000,000 |
+| `batch_release` | 20 | 5,529,240 | 12,000,000 | 1,189,528 | 3,000,000 |
+
+Observed values were captured with Soroban SDK `22.0.0` on 2026-07-24. Exact
+resource-fee stroops are network-config dependent, so simulate against the
+target network before raising `MAX_BATCH_RELEASE` or adding more release-side
+transfers:
+
+```bash
+stellar contract invoke \
+  --id "$ESCROW_CONTRACT_ID" \
+  --source-account "$SOURCE_ACCOUNT" \
+  --network "$NETWORK" \
+  --send=no \
+  --cost \
+  -- \
+  batch_release \
+  --order_ids "$ORDER_IDS"
+```
+
+For the complex `batch_deposit` tuple vector, use the generated CLI help for the
+deployed contract and run the same `--send=no --cost` simulation with 20 entries.
+
 ## Futurenet E2E Integration Test (#861)
 
 The script `contract/test-futurenet.sh` runs a full end-to-end test of the escrow contract on **Stellar Futurenet** using real XLM transfers.
@@ -395,4 +447,3 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md) for full guidance on:
 - Issue workflow and label guide
 
 For security vulnerabilities, follow the process in [SECURITY.md](./SECURITY.md) instead of opening a public issue.
-
