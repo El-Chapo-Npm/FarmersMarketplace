@@ -258,12 +258,6 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Must be called once to register the platform fee recipient.
-    /// Prefer `initialize()` for new deployments; this is kept for backward compatibility.
-    pub fn init(env: Env, platform_address: Address) {
-        env.storage()
-            .instance()
-            .set(&DataKey::Platform, &platform_address);
     /// Update the platform fee recipient address. Admin-only; can only be called
     /// after initialize(). Kept for backward compatibility; prefer initialize()
     /// for new deployments. (#954)
@@ -641,13 +635,6 @@ impl EscrowContract {
             .publish(("escrow", "release", order_id), farmer_amount);
 
         // #851 — Mint reward tokens for the buyer using try_call (non-blocking)
-        // Calculate reward amount as 1% of the released amount (100 basis points)
-        let reward_amount = (farmer_amount * 100) / 10_000;
-        if let Some(reward_token_address) =
-            env.storage().instance().get(&DataKey::RewardTokenContract)
-        {
-
-        // #851 — Mint reward tokens for the buyer using try_call (non-blocking)
         // Calculate reward amount using the admin-configurable rate (default 1% = 100 bps)
         let reward_bps: u32 = env
             .storage()
@@ -848,15 +835,6 @@ impl EscrowContract {
         Ok(stream_id)
     }
 
-    pub fn set_admin(env: Env, admin: Address) {
-        admin.require_auth();
-        if env.storage().instance().has(&DataKey::Admin) {
-            panic!("admin already set");
-        }
-        let transfer = AdminTransfer {
-            current_admin: admin,
-            pending_admin: None,
-        };
     /// Rotate the admin to a new address. Admin-only; can only be called after
     /// initialize() has been called (i.e. an admin must already exist). Prevents
     /// front-running attacks during bootstrap. (#954)
@@ -1743,7 +1721,6 @@ impl EscrowContract {
 
     /// Admin-only: configure cooperative members (ed25519 public keys) and
     /// the minimum signature threshold required for `multisig_release`.
-    pub fn set_coop(env: Env, members: Vec<BytesN<32>>, threshold: u32) -> Result<(), EscrowError> {
     /// Number of members is capped at `MAX_COOP_SIGNERS` to prevent unbounded
     /// loop costs in multisig_release signature verification. (#979)
     pub fn set_coop(
@@ -3898,6 +3875,8 @@ mod test {
             .unwrap_or(0);
         assert_eq!(buyer_count, 5);
         assert_eq!(farmer_count, 5);
+    }
+
     #[test]
     fn paginated_escrow_returns_expected_page_and_total() {
         let env = Env::default();
