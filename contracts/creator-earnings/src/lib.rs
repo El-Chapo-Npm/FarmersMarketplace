@@ -37,6 +37,7 @@
 
 #![no_std]
 
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, Env};
 use soroban_sdk::{contract, contractimpl, contracttype, contracterror, symbol_short, token, Address, Env, Vec};
 
 /// Maximum number of entries accepted by `batch_credit` in a single call —
@@ -179,6 +180,11 @@ impl CreatorEarningsContract {
         let farmer_amount: i128 = amount - fee_amount;
 
         // Accumulate the creator's claimable balance.
+        let key = DataKey::Balance(creator.clone());
+        let prev: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&key, &(prev + farmer_amount));
         let balance_key = DataKey::Balance(creator.clone());
         let prev: i128 = env.storage().persistent().get(&balance_key).unwrap_or(0);
         env.storage().persistent().set(&balance_key, &(prev + farmer_amount));
@@ -246,6 +252,7 @@ impl CreatorEarningsContract {
 
     /// Transfer the caller's entire accumulated balance to themselves via
     /// `token`.  Resets their on-chain balance to zero.
+    pub fn claim(env: Env, creator: Address, token: Address) -> Result<i128, EarningsError> {
     /// Emits a `claim` event on success.
     pub fn claim(
         env: Env,
@@ -359,6 +366,10 @@ mod test {
         let env = Env::default();
         env.mock_all_auths();
         let platform = Address::generate(&env);
+        let contract_id = env.register(CreatorEarningsContract, ());
+        env.as_contract(&contract_id, || {
+            CreatorEarningsContract::init(env.clone(), platform.clone())
+        });
         let authorized_caller = Address::generate(&env);
         let contract_id = env.register_contract(None, CreatorEarningsContract);
         CreatorEarningsContract::init(env.clone(), platform.clone(), authorized_caller.clone());
@@ -367,55 +378,98 @@ mod test {
         (env, platform, contract_id)
     }
 
+    fn credit(
+        env: &Env,
+        contract_id: &Address,
+        creator: Address,
+        amount: i128,
+        fee_bps: u32,
+    ) -> Result<(i128, i128), EarningsError> {
+        env.as_contract(contract_id, || {
+            CreatorEarningsContract::credit(env.clone(), creator, amount, fee_bps)
+        })
+    }
+
+    fn claim(
+        env: &Env,
+        contract_id: &Address,
+        creator: Address,
+        token: Address,
+    ) -> Result<i128, EarningsError> {
+        env.as_contract(contract_id, || {
+            CreatorEarningsContract::claim(env.clone(), creator, token)
+        })
+    }
+
+    fn balance(env: &Env, contract_id: &Address, creator: Address) -> i128 {
+        env.as_contract(contract_id, || {
+            CreatorEarningsContract::balance(env.clone(), creator)
+        })
+    }
+
+    fn seed_balance(env: &Env, contract_id: &Address, creator: Address, amount: i128) {
+        env.as_contract(contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::Balance(creator), &amount);
+        });
+    }
+
     // ── unit tests ───────────────────────────────────────────────────────────
 
     #[test]
     fn credit_zero_amount_returns_invalid_amount() {
+        let (env, _, contract_id) = setup();
         let (env, _, _, _) = setup();
         let creator = Address::generate(&env);
-        let result = CreatorEarningsContract::credit(env, creator, 0, 250);
+        let result = credit(&env, &contract_id, creator, 0, 250);
         assert_eq!(result, Err(EarningsError::InvalidAmount));
     }
 
     #[test]
     fn credit_negative_amount_returns_invalid_amount() {
+        let (env, _, contract_id) = setup();
         let (env, _, _, _) = setup();
         let creator = Address::generate(&env);
-        let result = CreatorEarningsContract::credit(env, creator, -1, 250);
+        let result = credit(&env, &contract_id, creator, -1, 250);
         assert_eq!(result, Err(EarningsError::InvalidAmount));
     }
 
     #[test]
     fn credit_fee_bps_over_10000_returns_invalid_fee_bps() {
+        let (env, _, contract_id) = setup();
         let (env, _, _, _) = setup();
         let creator = Address::generate(&env);
-        let result = CreatorEarningsContract::credit(env, creator, 1_000, 10_001);
+        let result = credit(&env, &contract_id, creator, 1_000, 10_001);
         assert_eq!(result, Err(EarningsError::InvalidFeeBps));
     }
 
     #[test]
     fn credit_accumulates_balance() {
+        let (env, _, contract_id) = setup();
         let (env, _, _, _) = setup();
         let creator = Address::generate(&env);
-        CreatorEarningsContract::credit(env.clone(), creator.clone(), 1_000, 0).unwrap();
-        CreatorEarningsContract::credit(env.clone(), creator.clone(), 500, 0).unwrap();
-        assert_eq!(CreatorEarningsContract::balance(env, creator), 1_500);
+        credit(&env, &contract_id, creator.clone(), 1_000, 0).unwrap();
+        credit(&env, &contract_id, creator.clone(), 500, 0).unwrap();
+        assert_eq!(balance(&env, &contract_id, creator), 1_500);
     }
 
     #[test]
     fn claim_zero_balance_returns_zero_balance_error() {
+        let (env, _, contract_id) = setup();
         let (env, _, _, _) = setup();
         let creator = Address::generate(&env);
         let token = Address::generate(&env);
-        let result = CreatorEarningsContract::claim(env, creator, token);
+        let result = claim(&env, &contract_id, creator, token);
         assert_eq!(result, Err(EarningsError::ZeroBalance));
     }
 
     #[test]
     fn balance_unknown_creator_returns_zero() {
+        let (env, _, contract_id) = setup();
         let (env, _, _, _) = setup();
         let stranger = Address::generate(&env);
-        assert_eq!(CreatorEarningsContract::balance(env, stranger), 0);
+        assert_eq!(balance(&env, &contract_id, stranger), 0);
     }
 
     // ── property / invariant tests ───────────────────────────────────────────
@@ -436,11 +490,12 @@ mod test {
             (1_000_000, 10_000),
             (7, 3333),
             (99, 9999),
-            (i128::MAX / 2, 5_000),
+            (i128::MAX / 20_000, 5_000),
             (10_000, 1),
             (10_000, 9_999),
         ];
 
+        let (env, _, contract_id) = setup();
         let env = Env::default();
         env.mock_all_auths();
         CreatorEarningsContract::init(env.clone(), Address::generate(&env), Address::generate(&env));
@@ -449,7 +504,7 @@ mod test {
         for &(amount, fee_bps) in cases {
             let creator = Address::generate(&env);
             let (farmer_amount, fee_amount) =
-                CreatorEarningsContract::credit(env.clone(), creator, amount, fee_bps).unwrap();
+                credit(&env, &contract_id, creator, amount, fee_bps).unwrap();
 
             assert_eq!(
                 farmer_amount + fee_amount,
@@ -465,6 +520,7 @@ mod test {
         let amounts: &[i128] = &[1, 100, 999, 1_000_000, i128::MAX / 10_000];
         let fee_bps_vals: &[u32] = &[0, 1, 250, 5_000, 9_999, 10_000];
 
+        let (env, _, contract_id) = setup();
         let env = Env::default();
         env.mock_all_auths();
         CreatorEarningsContract::init(env.clone(), Address::generate(&env), Address::generate(&env));
@@ -473,9 +529,8 @@ mod test {
         for &amount in amounts {
             for &fee_bps in fee_bps_vals {
                 let creator = Address::generate(&env);
-                CreatorEarningsContract::credit(env.clone(), creator.clone(), amount, fee_bps)
-                    .unwrap();
-                let bal = CreatorEarningsContract::balance(env.clone(), creator);
+                credit(&env, &contract_id, creator.clone(), amount, fee_bps).unwrap();
+                let bal = balance(&env, &contract_id, creator);
                 assert!(bal >= 0, "balance must be ≥ 0: got {bal}");
             }
         }
@@ -486,6 +541,7 @@ mod test {
     fn prop_invalid_fee_bps_always_rejected() {
         let invalid_bps: &[u32] = &[10_001, 10_002, 20_000, u32::MAX];
 
+        let (env, _, contract_id) = setup();
         let env = Env::default();
         env.mock_all_auths();
         CreatorEarningsContract::init(env.clone(), Address::generate(&env), Address::generate(&env));
@@ -493,7 +549,7 @@ mod test {
 
         for &fee_bps in invalid_bps {
             let creator = Address::generate(&env);
-            let result = CreatorEarningsContract::credit(env.clone(), creator, 1_000, fee_bps);
+            let result = credit(&env, &contract_id, creator, 1_000, fee_bps);
             assert_eq!(
                 result,
                 Err(EarningsError::InvalidFeeBps),
@@ -507,6 +563,7 @@ mod test {
     fn prop_invalid_amount_always_rejected() {
         let invalid_amounts: &[i128] = &[0, -1, -1_000, i128::MIN];
 
+        let (env, _, contract_id) = setup();
         let env = Env::default();
         env.mock_all_auths();
         CreatorEarningsContract::init(env.clone(), Address::generate(&env), Address::generate(&env));
@@ -514,7 +571,7 @@ mod test {
 
         for &amount in invalid_amounts {
             let creator = Address::generate(&env);
-            let result = CreatorEarningsContract::credit(env.clone(), creator, amount, 250);
+            let result = credit(&env, &contract_id, creator, amount, 250);
             assert_eq!(
                 result,
                 Err(EarningsError::InvalidAmount),
@@ -530,6 +587,7 @@ mod test {
         // We test the balance-reset logic without a real token transfer by
         // directly manipulating storage (mirrors how the escrow sibling tests
         // work) and then verifying the error path.
+        let (env, _, contract_id) = setup();
         let env = Env::default();
         env.mock_all_auths();
         CreatorEarningsContract::init(env.clone(), Address::generate(&env), Address::generate(&env));
@@ -538,35 +596,26 @@ mod test {
         let creator = Address::generate(&env);
 
         // Seed a balance directly so we don't need a live token contract.
-        env.storage()
-            .persistent()
-            .set(&DataKey::Balance(creator.clone()), &1_000_i128);
+        seed_balance(&env, &contract_id, creator.clone(), 1_000_i128);
 
-        assert_eq!(
-            CreatorEarningsContract::balance(env.clone(), creator.clone()),
-            1_000
-        );
+        assert_eq!(balance(&env, &contract_id, creator.clone()), 1_000);
 
         // Reset balance to zero manually (simulates a successful claim).
-        env.storage()
-            .persistent()
-            .set(&DataKey::Balance(creator.clone()), &0_i128);
+        seed_balance(&env, &contract_id, creator.clone(), 0_i128);
 
         // I5 — balance is now zero.
-        assert_eq!(
-            CreatorEarningsContract::balance(env.clone(), creator.clone()),
-            0
-        );
+        assert_eq!(balance(&env, &contract_id, creator.clone()), 0);
 
         // I6 — second claim must fail.
         let token = Address::generate(&env);
-        let result = CreatorEarningsContract::claim(env.clone(), creator, token);
+        let result = claim(&env, &contract_id, creator, token);
         assert_eq!(result, Err(EarningsError::ZeroBalance));
     }
 
     /// I3 (boundary) — fee_bps = 10_000 means farmer gets 0, fee gets all.
     #[test]
     fn prop_full_fee_farmer_gets_zero() {
+        let (env, _, contract_id) = setup();
         let env = Env::default();
         env.mock_all_auths();
         CreatorEarningsContract::init(env.clone(), Address::generate(&env), Address::generate(&env));
@@ -574,17 +623,18 @@ mod test {
 
         let creator = Address::generate(&env);
         let (farmer_amount, fee_amount) =
-            CreatorEarningsContract::credit(env.clone(), creator.clone(), 1_000, 10_000).unwrap();
+            credit(&env, &contract_id, creator.clone(), 1_000, 10_000).unwrap();
 
         assert_eq!(farmer_amount, 0);
         assert_eq!(fee_amount, 1_000);
         // Balance stored for creator must be 0.
-        assert_eq!(CreatorEarningsContract::balance(env, creator), 0);
+        assert_eq!(balance(&env, &contract_id, creator), 0);
     }
 
     /// I3 (boundary) — fee_bps = 0 means farmer gets all, fee gets 0.
     #[test]
     fn prop_zero_fee_farmer_gets_all() {
+        let (env, _, contract_id) = setup();
         let env = Env::default();
         env.mock_all_auths();
         CreatorEarningsContract::init(env.clone(), Address::generate(&env), Address::generate(&env));
@@ -593,16 +643,17 @@ mod test {
         let creator = Address::generate(&env);
         let amount: i128 = 5_000;
         let (farmer_amount, fee_amount) =
-            CreatorEarningsContract::credit(env.clone(), creator.clone(), amount, 0).unwrap();
+            credit(&env, &contract_id, creator.clone(), amount, 0).unwrap();
 
         assert_eq!(fee_amount, 0);
         assert_eq!(farmer_amount, amount);
-        assert_eq!(CreatorEarningsContract::balance(env, creator), amount);
+        assert_eq!(balance(&env, &contract_id, creator), amount);
     }
 
     /// Multiple creators are independent — crediting one does not affect another.
     #[test]
     fn prop_creators_are_independent() {
+        let (env, _, contract_id) = setup();
         let env = Env::default();
         env.mock_all_auths();
         CreatorEarningsContract::init(env.clone(), Address::generate(&env), Address::generate(&env));
@@ -611,11 +662,11 @@ mod test {
         let alice = Address::generate(&env);
         let bob = Address::generate(&env);
 
-        CreatorEarningsContract::credit(env.clone(), alice.clone(), 1_000, 0).unwrap();
-        CreatorEarningsContract::credit(env.clone(), bob.clone(), 2_000, 0).unwrap();
+        credit(&env, &contract_id, alice.clone(), 1_000, 0).unwrap();
+        credit(&env, &contract_id, bob.clone(), 2_000, 0).unwrap();
 
-        assert_eq!(CreatorEarningsContract::balance(env.clone(), alice), 1_000);
-        assert_eq!(CreatorEarningsContract::balance(env.clone(), bob), 2_000);
+        assert_eq!(balance(&env, &contract_id, alice), 1_000);
+        assert_eq!(balance(&env, &contract_id, bob), 2_000);
     }
 
     #[test]

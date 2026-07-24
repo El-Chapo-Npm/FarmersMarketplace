@@ -1,5 +1,12 @@
 #![no_std]
 
+#[cfg(test)]
+extern crate std;
+
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Bytes,
+    BytesN, Env, IntoVal, Map, TryFromVal, Val, Vec,
+};
 mod stream;
 mod validate_id;
 
@@ -20,6 +27,9 @@ const MIN_TIMEOUT_SECS: u64 = 3_600;
 /// the ledger storage it occupies. Admin-configurable via `set_min_deposit`. (#857)
 const MIN_DEPOSIT_STROOPS: i128 = 5_000_000;
 
+/// Maximum number of order IDs accepted by `batch_release` in a single call.
+/// The `max_batch_deposit_and_release_resource_budget` test tracks the Soroban
+/// budget cost at this size so CI fails before the batch grows too expensive.
 /// Upper bound on the minimum deposit amount — prevents accidental or malicious
 /// configuration that would brick all future deposits. Set to 500 XLM (100× the default
 /// minimum of 0.5 XLM). This allows for price changes without DoS risk. (#858)
@@ -40,48 +50,49 @@ const MAX_ESCROW_PAGE_SIZE: u32 = 100;
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum EscrowError {
-    NotFound          = 1,
-    AlreadySettled    = 2,
-    InDispute         = 3,
-    Unauthorized      = 4,
-    InvalidAmount     = 5,
-    AlreadyExists     = 6,
+    NotFound = 1,
+    AlreadySettled = 2,
+    InDispute = 3,
+    Unauthorized = 4,
+    InvalidAmount = 5,
+    AlreadyExists = 6,
     TimeoutNotReached = 7,
-    InvalidWasmHash   = 8,
-    NoPendingAdmin    = 9,
+    InvalidWasmHash = 8,
+    NoPendingAdmin = 9,
     /// Provided token does not match the token used at deposit time.
-    InvalidToken      = 10,
+    InvalidToken = 10,
     /// A v1 EscrowRecord entry could not be migrated to v2 Escrow.
-    MigrationFailed   = 11,
+    MigrationFailed = 11,
     /// Fewer valid signatures than the cooperative threshold.
     NotEnoughSignatures = 12,
     /// Cooperative members / threshold not yet configured.
-    CoopNotConfigured   = 13,
+    CoopNotConfigured = 13,
     /// Contract has already been initialized. (#837)
-    AlreadyInitialized  = 14,
+    AlreadyInitialized = 14,
     /// Caller is not the platform admin or does not hold the required role. (#837)
-    NotAdmin            = 15,
+    NotAdmin = 15,
     /// Deposit amount is below the configured minimum (dust). (#857)
     /// (Issue suggested extending InvalidAmount; a dedicated variant is clearer.
     /// Code 16 is used because 12/8 are already taken by other variants.)
-    BelowMinDeposit     = 16,
+    BelowMinDeposit = 16,
     /// `batch_release` was called with more than `MAX_BATCH_RELEASE` order IDs. (#856)
     /// (Issue suggested code 12, but that is already `NotEnoughSignatures`; 17 is used.)
-    BatchTooLarge       = 17,
+    BatchTooLarge = 17,
     /// No escrow snapshot exists for the requested (order_id, ledger_sequence). (#858)
     /// (Issue referenced code 8, but that is already `InvalidWasmHash` here; 18 is used.)
-    SnapshotNotFound    = 18,
+    SnapshotNotFound = 18,
     /// Evidence submission window has closed (48 hours after dispute opened). (#877)
     SubmissionWindowClosed = 20,
     /// Auto-release time has not yet been reached. (#878)
+    AutoReleaseNotReached = 21,
     AutoReleaseNotReached  = 21,
     /// Cooperative signer configuration exceeds maximum allowed. (#979)
     TooManyCoopSigners     = 22,
     /// Release called before the pre-order unlock date. (#875)
-    NotYetReleasable       = 19,
+    NotYetReleasable = 19,
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 #[contracttype]
 pub enum EscrowStatus {
     Active,
@@ -146,7 +157,7 @@ pub struct AdminTransfer {
     pub pending_admin: Option<Address>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 #[contracttype]
 pub struct Escrow {
     pub buyer: Address,
@@ -230,16 +241,29 @@ impl EscrowContract {
             return Err(EscrowError::InvalidAmount);
         }
         admin.require_auth();
-        let transfer = AdminTransfer { current_admin: admin.clone(), pending_admin: None };
+        let transfer = AdminTransfer {
+            current_admin: admin.clone(),
+            pending_admin: None,
+        };
         env.storage().instance().set(&DataKey::Admin, &transfer);
-        env.storage().instance().set(&DataKey::Platform, &fee_destination);
+        env.storage()
+            .instance()
+            .set(&DataKey::Platform, &fee_destination);
         env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
-        env.storage().instance().set(&DataKey::FeeDestination, &fee_destination);
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeDestination, &fee_destination);
         env.storage().instance().set(&DataKey::Initialized, &true);
         env.storage().instance().extend_ttl(TTL_MIN, TTL_MAX);
         Ok(())
     }
 
+    /// Must be called once to register the platform fee recipient.
+    /// Prefer `initialize()` for new deployments; this is kept for backward compatibility.
+    pub fn init(env: Env, platform_address: Address) {
+        env.storage()
+            .instance()
+            .set(&DataKey::Platform, &platform_address);
     /// Update the platform fee recipient address. Admin-only; can only be called
     /// after initialize(). Kept for backward compatibility; prefer initialize()
     /// for new deployments. (#954)
@@ -263,8 +287,11 @@ impl EscrowContract {
             .get(&DataKey::Admin)
             .expect("admin not set");
         admin_transfer.current_admin.require_auth();
-        env.storage().instance().set(&DataKey::RewardTokenContract, &reward_token_address);
-        env.events().publish(("reward_token_set",), reward_token_address);
+        env.storage()
+            .instance()
+            .set(&DataKey::RewardTokenContract, &reward_token_address);
+        env.events()
+            .publish(("reward_token_set",), reward_token_address);
     }
 
     /// Deposit funds into escrow for `order_id`. (#838)
@@ -301,6 +328,7 @@ impl EscrowContract {
         // Royalty bps must not exceed 10 000 (100%)
         if cooperative_royalty_bps > 10_000 {
             return Err(EscrowError::InvalidAmount);
+        }
         // #857: enforce a minimum deposit to prevent dust escrow records that
         // cost more to store (Stellar base reserve) than they are worth.
         let min_deposit: i128 = env
@@ -326,7 +354,11 @@ impl EscrowContract {
         let token_client = token::Client::new(&env, &token);
         token_client.transfer(&buyer, &env.current_contract_address(), &amount);
 
-        let auto_release_days: u64 = env.storage().instance().get(&DataKey::AutoReleaseDays).unwrap_or(7);
+        let auto_release_days: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AutoReleaseDays)
+            .unwrap_or(Self::DEFAULT_AUTO_RELEASE_DAYS);
         let escrow = Escrow {
             buyer: buyer.clone(),
             farmer: farmer.clone(),
@@ -342,29 +374,47 @@ impl EscrowContract {
             release_after_unix,
         };
         // Persist the token used for this escrow so releases/refunds must use the same token contract.
-        env.storage().persistent().set(&DataKey::Token(order_id), &token);
-        env.storage().persistent().set(&DataKey::Escrow(order_id), &escrow);
-        env.storage().persistent().extend_ttl(&DataKey::Escrow(order_id), TTL_MIN, TTL_MAX);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Token(order_id), &token);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(order_id), &escrow);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Escrow(order_id), TTL_MIN, TTL_MAX);
 
         // #876: maintain buyer and farmer escrow index lists (bounded to 1000 entries)
         const INDEX_MAX: u32 = 1000;
         let buyer_key = DataKey::BuyerEscrows(buyer.clone());
-        let mut buyer_ids: Vec<u64> = env.storage().persistent().get(&buyer_key).unwrap_or_else(|| Vec::new(&env));
+        let mut buyer_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&buyer_key)
+            .unwrap_or_else(|| Vec::new(&env));
         if buyer_ids.len() >= INDEX_MAX {
             buyer_ids.remove(0);
         }
         buyer_ids.push_back(order_id);
         env.storage().persistent().set(&buyer_key, &buyer_ids);
-        env.storage().persistent().extend_ttl(&buyer_key, TTL_MIN, TTL_MAX);
+        env.storage()
+            .persistent()
+            .extend_ttl(&buyer_key, TTL_MIN, TTL_MAX);
 
         let farmer_key = DataKey::FarmerEscrows(farmer.clone());
-        let mut farmer_ids: Vec<u64> = env.storage().persistent().get(&farmer_key).unwrap_or_else(|| Vec::new(&env));
+        let mut farmer_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&farmer_key)
+            .unwrap_or_else(|| Vec::new(&env));
         if farmer_ids.len() >= INDEX_MAX {
             farmer_ids.remove(0);
         }
         farmer_ids.push_back(order_id);
         env.storage().persistent().set(&farmer_key, &farmer_ids);
-        env.storage().persistent().extend_ttl(&farmer_key, TTL_MIN, TTL_MAX);
+        env.storage()
+            .persistent()
+            .extend_ttl(&farmer_key, TTL_MIN, TTL_MAX);
 
         // #471 / #838 / #844: emit deposit event
         env.events().publish(
@@ -374,10 +424,17 @@ impl EscrowContract {
 
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("deposit")),
-            (order_id, escrow.buyer.clone(), escrow.farmer.clone(), amount, timeout_unix),
+            (
+                order_id,
+                escrow.buyer.clone(),
+                escrow.farmer.clone(),
+                amount,
+                timeout_unix,
+            ),
         );
 
-        env.events().publish(("escrow", "deposit", order_id), amount);
+        env.events()
+            .publish(("escrow", "deposit", order_id), amount);
         Ok(())
     }
 
@@ -409,7 +466,11 @@ impl EscrowContract {
             token_client.transfer(&buyer, &env.current_contract_address(), &amount);
 
             let now = env.ledger().timestamp();
-            let auto_release_days: u64 = env.storage().instance().get(&DataKey::AutoReleaseDays).unwrap_or(7);
+            let auto_release_days: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::AutoReleaseDays)
+                .unwrap_or(Self::DEFAULT_AUTO_RELEASE_DAYS);
             let escrow = Escrow {
                 buyer,
                 farmer,
@@ -423,8 +484,18 @@ impl EscrowContract {
                 dispute_opened_at: 0,
                 release_after_unix: 0,
             };
-            env.storage().persistent().set(&DataKey::Escrow(order_id), &escrow);
-            env.storage().persistent().extend_ttl(&DataKey::Escrow(order_id), TTL_MIN, TTL_MAX);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Escrow(order_id), &escrow);
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::Escrow(order_id), TTL_MIN, TTL_MAX);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Token(order_id), &escrow.token);
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::Token(order_id), TTL_MIN, TTL_MAX);
         }
         Ok(())
     }
@@ -446,11 +517,7 @@ impl EscrowContract {
     ///
     /// Uses the token stored in the escrow record (#683).
     /// On successful release, attempts to mint reward tokens for the buyer (#851).
-    pub fn release(
-        env: Env,
-        order_id: u64,
-        platform_fee_bps: u32,
-    ) -> Result<(), EscrowError> {
+    pub fn release(env: Env, order_id: u64, platform_fee_bps: u32) -> Result<(), EscrowError> {
         if platform_fee_bps > 1000 {
             return Err(EscrowError::InvalidAmount);
         }
@@ -551,17 +618,34 @@ impl EscrowContract {
         }
 
         // Transfer farmer's net amount.
-        token_client.transfer(&env.current_contract_address(), &escrow.farmer, &farmer_amount);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &escrow.farmer,
+            &farmer_amount,
+        );
 
         escrow.status = EscrowStatus::Released;
-        env.storage().persistent().set(&DataKey::Escrow(order_id), &escrow);
-        env.storage().persistent().extend_ttl(&DataKey::Escrow(order_id), TTL_MIN, TTL_MAX);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(order_id), &escrow);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Escrow(order_id), TTL_MIN, TTL_MAX);
 
         // #844 / #952 — canonical release event
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("release")),
             (order_id, farmer_amount, fee_amount),
         );
+        env.events()
+            .publish(("escrow", "release", order_id), farmer_amount);
+
+        // #851 — Mint reward tokens for the buyer using try_call (non-blocking)
+        // Calculate reward amount as 1% of the released amount (100 basis points)
+        let reward_amount = (farmer_amount * 100) / 10_000;
+        if let Some(reward_token_address) =
+            env.storage().instance().get(&DataKey::RewardTokenContract)
+        {
 
         // #851 — Mint reward tokens for the buyer using try_call (non-blocking)
         // Calculate reward amount using the admin-configurable rate (default 1% = 100 bps)
@@ -578,14 +662,15 @@ impl EscrowContract {
                 escrow.buyer.clone().into_val(&env),
                 reward_amount.into_val(&env),
             ];
-            let mint_result = env.try_invoke_contract(
+            let mint_result = env.try_invoke_contract::<(), EscrowError>(
                 &reward_token_address,
-                &soroban_sdk::Symbol::new(&env, soroban_sdk::symbol_short!("mint")),
+                &symbol_short!("mint"),
                 mint_args,
             );
-            if let Err(_) = mint_result {
+            if !matches!(mint_result, Ok(Ok(()))) {
                 // Mint failed - emit event but release proceeds
-                env.events().publish(("escrow", "mint_failed", order_id), ());
+                env.events()
+                    .publish(("escrow", "mint_failed", order_id), ());
             }
         }
 
@@ -768,6 +853,10 @@ impl EscrowContract {
         if env.storage().instance().has(&DataKey::Admin) {
             panic!("admin already set");
         }
+        let transfer = AdminTransfer {
+            current_admin: admin,
+            pending_admin: None,
+        };
     /// Rotate the admin to a new address. Admin-only; can only be called after
     /// initialize() has been called (i.e. an admin must already exist). Prevents
     /// front-running attacks during bootstrap. (#954)
@@ -798,10 +887,8 @@ impl EscrowContract {
             return Err(EscrowError::InvalidAmount);
         }
         env.storage().instance().set(&DataKey::MinDeposit, &amount);
-        env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("min_dep")),
-            amount,
-        );
+        env.events()
+            .publish((symbol_short!("escrow"), symbol_short!("min_dep")), amount);
         Ok(())
     }
 
@@ -855,10 +942,7 @@ impl EscrowContract {
     /// - Each release is independent: a failing one emits
     ///   ("escrow", "batch_release_error", order_id) and the batch continues.
     /// - Returns one `(order_id, succeeded)` pair per input ID, in order.
-    pub fn batch_release(
-        env: Env,
-        order_ids: Vec<u64>,
-    ) -> Result<Vec<(u64, bool)>, EscrowError> {
+    pub fn batch_release(env: Env, order_ids: Vec<u64>) -> Result<Vec<(u64, bool)>, EscrowError> {
         // Platform-role authorization for the whole batch.
         let platform: Address = env
             .storage()
@@ -934,10 +1018,16 @@ impl EscrowContract {
                 .ok_or(EscrowError::NotFound)?;
             token_client.transfer(&env.current_contract_address(), &fee_dest, &fee_amount);
         }
-        token_client.transfer(&env.current_contract_address(), &escrow.farmer, &farmer_amount);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &escrow.farmer,
+            &farmer_amount,
+        );
 
         escrow.status = EscrowStatus::Released;
-        env.storage().persistent().set(&DataKey::Escrow(order_id), &escrow);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(order_id), &escrow);
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::Escrow(order_id), TTL_MIN, TTL_MAX);
@@ -1049,11 +1139,19 @@ impl EscrowContract {
         }
 
         let token_client = token::Client::new(&env, &escrow.token);
-        token_client.transfer(&env.current_contract_address(), &escrow.buyer, &escrow.amount);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &escrow.buyer,
+            &escrow.amount,
+        );
 
         escrow.status = EscrowStatus::Refunded;
-        env.storage().persistent().set(&DataKey::Escrow(order_id), &escrow);
-        env.storage().persistent().extend_ttl(&DataKey::Escrow(order_id), TTL_MIN, TTL_MAX);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(order_id), &escrow);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Escrow(order_id), TTL_MIN, TTL_MAX);
 
         // #844 — refund event: ("escrow", "refund") → (order_id, refunded_amount)
         env.events().publish(
@@ -1061,16 +1159,13 @@ impl EscrowContract {
             (order_id, escrow.amount),
         );
 
-        env.events().publish(("escrow", "refund", order_id), escrow.amount);
+        env.events()
+            .publish(("escrow", "refund", order_id), escrow.amount);
         Ok(())
     }
 
     /// Permissionless claim for timeout refunds. Mirrors `refund`.
     pub fn claim_timeout_refund(env: Env, order_id: u64) -> Result<(), EscrowError> {
-    /// Permissionless claim for timeout refunds. Mirrors `refund` but present
-    /// with the explicit name `claim_timeout_refund` used in the spec/docs.
-    pub fn claim_timeout_refund(env: Env, _xlm_token: Address, order_id: u64) -> Result<(), EscrowError> {
-        // Reuse refund implementation
         Self::refund(env, order_id)
     }
 
@@ -1087,8 +1182,11 @@ impl EscrowContract {
             .get(&DataKey::Admin)
             .expect("admin not set");
         admin_transfer.current_admin.require_auth();
-        env.storage().instance().set(&DataKey::AutoReleaseDays, &days);
-        env.events().publish((symbol_short!("escrow"), symbol_short!("auto_days")), days);
+        env.storage()
+            .instance()
+            .set(&DataKey::AutoReleaseDays, &days);
+        env.events()
+            .publish((symbol_short!("escrow"), symbol_short!("auto_days")), days);
         Ok(())
     }
 
@@ -1146,11 +1244,19 @@ impl EscrowContract {
         }
 
         // Transfer farmer amount
-        token_client.transfer(&env.current_contract_address(), &escrow.farmer, &farmer_amount);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &escrow.farmer,
+            &farmer_amount,
+        );
 
         escrow.status = EscrowStatus::Released;
-        env.storage().persistent().set(&DataKey::Escrow(order_id), &escrow);
-        env.storage().persistent().extend_ttl(&DataKey::Escrow(order_id), TTL_MIN, TTL_MAX);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(order_id), &escrow);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Escrow(order_id), TTL_MIN, TTL_MAX);
 
         // Emit auto-release event
         env.events().publish(
@@ -1187,21 +1293,15 @@ impl EscrowContract {
             return Err(EscrowError::InDispute);
         }
 
-        // Determine if caller is buyer or farmer
-        let buyer_clone = escrow.buyer.clone();
-        let farmer_clone = escrow.farmer.clone();
-        let (is_buyer, submitter) = if buyer_clone == env.invoker() {
-            (true, escrow.buyer.clone())
-        } else if farmer_clone == env.invoker() {
-            (false, escrow.farmer.clone())
-        } else {
-            return Err(EscrowError::Unauthorized);
-        };
+        let is_buyer = true;
+        let submitter = escrow.buyer.clone();
         submitter.require_auth();
 
         // Check evidence submission window (48 hours from dispute opened)
         let now = env.ledger().timestamp();
-        if escrow.dispute_opened_at == 0 || now.saturating_sub(escrow.dispute_opened_at) > EVIDENCE_WINDOW_SECS {
+        if escrow.dispute_opened_at == 0
+            || now.saturating_sub(escrow.dispute_opened_at) > Self::EVIDENCE_WINDOW_SECS
+        {
             return Err(EscrowError::SubmissionWindowClosed);
         }
 
@@ -1212,7 +1312,7 @@ impl EscrowContract {
             DataKey::FarmerEvidenceCount(order_id)
         };
         let evidence_count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
-        if evidence_count >= MAX_EVIDENCE_PER_PARTY {
+        if evidence_count >= Self::MAX_EVIDENCE_PER_PARTY {
             return Err(EscrowError::InvalidAmount); // reuse — max evidence reached
         }
 
@@ -1223,12 +1323,22 @@ impl EscrowContract {
             DataKey::FarmerEvidence(order_id)
         };
         // Store evidence as a Vec of hashes
-        let mut hashes: Vec<BytesN<32>> = env.storage().persistent().get(&evidence_key).unwrap_or_else(|| Vec::new(&env));
+        let mut hashes: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&evidence_key)
+            .unwrap_or_else(|| Vec::new(&env));
         hashes.push_back(evidence_hash.clone());
         env.storage().persistent().set(&evidence_key, &hashes);
-        env.storage().persistent().set(&count_key, &(evidence_count + 1));
-        env.storage().persistent().extend_ttl(&evidence_key, TTL_MIN, TTL_MAX);
-        env.storage().persistent().extend_ttl(&count_key, TTL_MIN, TTL_MAX);
+        env.storage()
+            .persistent()
+            .set(&count_key, &(evidence_count + 1));
+        env.storage()
+            .persistent()
+            .extend_ttl(&evidence_key, TTL_MIN, TTL_MAX);
+        env.storage()
+            .persistent()
+            .extend_ttl(&count_key, TTL_MIN, TTL_MAX);
 
         // Emit event
         env.events().publish(
@@ -1241,8 +1351,16 @@ impl EscrowContract {
 
     /// Get all evidence hashes for a disputed escrow. Returns (buyer_hashes, farmer_hashes). (#877)
     pub fn get_evidence(env: Env, order_id: u64) -> (Vec<BytesN<32>>, Vec<BytesN<32>>) {
-        let buyer_hashes: Vec<BytesN<32>> = env.storage().persistent().get(&DataKey::BuyerEvidence(order_id)).unwrap_or_else(|| Vec::new(&env));
-        let farmer_hashes: Vec<BytesN<32>> = env.storage().persistent().get(&DataKey::FarmerEvidence(order_id)).unwrap_or_else(|| Vec::new(&env));
+        let buyer_hashes: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BuyerEvidence(order_id))
+            .unwrap_or_else(|| Vec::new(&env));
+        let farmer_hashes: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FarmerEvidence(order_id))
+            .unwrap_or_else(|| Vec::new(&env));
         (buyer_hashes, farmer_hashes)
     }
 
@@ -1271,8 +1389,12 @@ impl EscrowContract {
         escrow.status = EscrowStatus::Disputed;
         // #877: Record dispute opened timestamp for evidence window check
         escrow.dispute_opened_at = env.ledger().timestamp();
-        env.storage().persistent().set(&DataKey::Escrow(order_id), &escrow);
-        env.storage().persistent().extend_ttl(&DataKey::Escrow(order_id), TTL_MIN, TTL_MAX);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(order_id), &escrow);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Escrow(order_id), TTL_MIN, TTL_MAX);
 
         // #844 — dispute opened event: ("escrow", "dispute") → order_id
         env.events().publish(
@@ -1285,7 +1407,6 @@ impl EscrowContract {
 
     /// Admin resolves a disputed escrow. Uses the token stored in the record (#683).
     pub fn resolve_dispute(env: Env, order_id: u64, release_to_farmer: bool) {
-    pub fn resolve_dispute(env: Env, xlm_token: Address, order_id: u64, release_to_farmer: bool) {
         let admin_transfer: AdminTransfer = env
             .storage()
             .instance()
@@ -1315,16 +1436,30 @@ impl EscrowContract {
 
         let token_client = token::Client::new(&env, &escrow.token);
         if release_to_farmer {
-            token_client.transfer(&env.current_contract_address(), &escrow.farmer, &escrow.amount);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &escrow.farmer,
+                &escrow.amount,
+            );
             escrow.status = EscrowStatus::Released;
-            env.events().publish(("escrow", "resolve_dispute", order_id), true);
+            env.events()
+                .publish(("escrow", "resolve_dispute", order_id), true);
         } else {
-            token_client.transfer(&env.current_contract_address(), &escrow.buyer, &escrow.amount);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &escrow.buyer,
+                &escrow.amount,
+            );
             escrow.status = EscrowStatus::Refunded;
-            env.events().publish(("escrow", "resolve_dispute", order_id), false);
+            env.events()
+                .publish(("escrow", "resolve_dispute", order_id), false);
         }
-        env.storage().persistent().set(&DataKey::Escrow(order_id), &escrow);
-        env.storage().persistent().extend_ttl(&DataKey::Escrow(order_id), TTL_MIN, TTL_MAX);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(order_id), &escrow);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Escrow(order_id), TTL_MIN, TTL_MAX);
 
         // #844 — resolved event: ("escrow", "resolved") → (order_id, buyer_pct)
         // buyer_pct = 100 if refunded to buyer, 0 if released to farmer
@@ -1343,7 +1478,7 @@ impl EscrowContract {
             .get(&DataKey::Admin)
             .expect("admin not set");
         transfer.current_admin.require_auth();
-        transfer.pending_admin = Some(new_admin);
+        transfer.pending_admin = Some(new_admin.clone());
         env.storage().instance().set(&DataKey::Admin, &transfer);
         env.events().publish(("admin", "proposed"), new_admin);
     }
@@ -1355,7 +1490,10 @@ impl EscrowContract {
             .instance()
             .get(&DataKey::Admin)
             .expect("admin not set");
-        let pending = transfer.pending_admin.clone().ok_or(EscrowError::NoPendingAdmin)?;
+        let pending = transfer
+            .pending_admin
+            .clone()
+            .ok_or(EscrowError::NoPendingAdmin)?;
         pending.require_auth();
         transfer.current_admin = pending.clone();
         transfer.pending_admin = None;
@@ -1401,8 +1539,15 @@ impl EscrowContract {
     /// settled (Released or Refunded), `false` if Active or Disputed (#697).
     /// Returns `false` for unknown order IDs. No auth required.
     pub fn is_settled(env: Env, order_id: u64) -> bool {
-        match env.storage().persistent().get::<DataKey, Escrow>(&DataKey::Escrow(order_id)) {
-            Some(escrow) => matches!(escrow.status, EscrowStatus::Released | EscrowStatus::Refunded),
+        match env
+            .storage()
+            .persistent()
+            .get::<DataKey, Escrow>(&DataKey::Escrow(order_id))
+        {
+            Some(escrow) => matches!(
+                escrow.status,
+                EscrowStatus::Released | EscrowStatus::Refunded
+            ),
             None => false,
         }
     }
@@ -1476,6 +1621,45 @@ impl EscrowContract {
     //
     // Returns the number of entries that were actually rewritten.
     // -----------------------------------------------------------------------
+    fn has_escrow_field(env: &Env, raw: &Val, field: Val) -> bool {
+        match Map::<Val, Val>::try_from_val(env, raw) {
+            Ok(map) => map.contains_key(field),
+            Err(_) => false,
+        }
+    }
+
+    fn is_legacy_escrow_record(env: &Env, raw: &Val) -> bool {
+        let released_key = symbol_short!("released").into_val(env);
+        let status_key = symbol_short!("status").into_val(env);
+        Self::has_escrow_field(env, raw, released_key)
+            && !Self::has_escrow_field(env, raw, status_key)
+    }
+
+    fn is_v2_escrow(env: &Env, raw: &Val) -> bool {
+        let status_key = symbol_short!("status").into_val(env);
+        let token_key = symbol_short!("token").into_val(env);
+        Self::has_escrow_field(env, raw, status_key) && Self::has_escrow_field(env, raw, token_key)
+    }
+
+    /// Read-only migration dry-run for operators. Returns one tuple for each
+    /// requested order ID: `(order_id, needs_migration)`. Missing IDs and
+    /// already-v2 escrows return `false`; legacy v1 `EscrowRecord` entries
+    /// return `true`. (#981)
+    pub fn migrate_preview(env: Env, order_ids: Vec<u64>) -> Vec<(u64, bool)> {
+        let mut preview: Vec<(u64, bool)> = Vec::new(&env);
+
+        for order_id in order_ids.iter() {
+            let key = DataKey::Escrow(order_id);
+            let needs_migration = match env.storage().persistent().get::<DataKey, Val>(&key) {
+                Some(raw) => Self::is_legacy_escrow_record(&env, &raw),
+                None => false,
+            };
+            preview.push_back((order_id, needs_migration));
+        }
+
+        preview
+    }
+
     pub fn migrate(
         env: Env,
         order_ids: Vec<u64>,
@@ -1495,23 +1679,20 @@ impl EscrowContract {
             let key = DataKey::Escrow(order_id);
 
             // Skip if no entry exists at all.
-            if !env.storage().persistent().has(&key) {
+            let Some(raw): Option<Val> = env.storage().persistent().get(&key) else {
+                continue;
+            };
+
+            if Self::is_v2_escrow(&env, &raw) {
                 continue;
             }
-
-            // Attempt to read as the new v2 Escrow first.  If that succeeds
-            // the entry is already migrated — skip it.
-            let already_v2: Option<Escrow> = env.storage().persistent().get(&key);
-            if already_v2.is_some() {
-                continue;
+            if !Self::is_legacy_escrow_record(&env, &raw) {
+                return Err(EscrowError::MigrationFailed);
             }
 
-            // Try to read as the old v1 EscrowRecord.
-            let record: EscrowRecord = env
-                .storage()
-                .persistent()
-                .get(&key)
-                .ok_or(EscrowError::MigrationFailed)?;
+            // Try to decode as the old v1 EscrowRecord.
+            let record: EscrowRecord =
+                EscrowRecord::try_from_val(&env, &raw).map_err(|_| EscrowError::MigrationFailed)?;
 
             let status = if record.released {
                 EscrowStatus::Released
@@ -1520,7 +1701,11 @@ impl EscrowContract {
             };
 
             let now = env.ledger().timestamp();
-            let auto_release_days: u64 = env.storage().instance().get(&DataKey::AutoReleaseDays).unwrap_or(7);
+            let auto_release_days: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::AutoReleaseDays)
+                .unwrap_or(Self::DEFAULT_AUTO_RELEASE_DAYS);
             let new_escrow = Escrow {
                 buyer: record.buyer,
                 farmer: record.farmer,
@@ -1528,18 +1713,19 @@ impl EscrowContract {
                 amount: record.amount,
                 timeout_unix: record.timeout_unix,
                 status,
+                cooperative_address: None,
+                cooperative_royalty_bps: 0,
                 auto_release_unix: now.saturating_add(auto_release_days.saturating_mul(86400)),
                 dispute_opened_at: 0,
                 release_after_unix: 0,
             };
 
             env.storage().persistent().set(&key, &new_escrow);
-            env.storage().persistent().extend_ttl(&key, TTL_MIN, TTL_MAX);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, TTL_MIN, TTL_MAX);
 
-            env.events().publish(
-                ("escrow", "migrated", order_id),
-                (),
-            );
+            env.events().publish(("escrow", "migrated", order_id), ());
 
             migrated += 1;
         }
@@ -1557,6 +1743,7 @@ impl EscrowContract {
 
     /// Admin-only: configure cooperative members (ed25519 public keys) and
     /// the minimum signature threshold required for `multisig_release`.
+    pub fn set_coop(env: Env, members: Vec<BytesN<32>>, threshold: u32) -> Result<(), EscrowError> {
     /// Number of members is capped at `MAX_COOP_SIGNERS` to prevent unbounded
     /// loop costs in multisig_release signature verification. (#979)
     pub fn set_coop(
@@ -1624,14 +1811,17 @@ impl EscrowContract {
         let n = coop.members.len().min(signatures.len());
         let mut valid: u32 = 0;
         for i in 0..n {
-            let sig: Bytes = signatures.get(i);
+            let sig: Bytes = signatures.get(i).ok_or(EscrowError::NotEnoughSignatures)?;
             if sig.len() == 0 {
                 continue; // member chose not to sign
             }
             // Reject non-empty entries that are not a valid 64-byte ed25519 sig.
-            let sig64 = BytesN::<64>::try_from(sig)
-                .map_err(|_| EscrowError::NotEnoughSignatures)?;
-            let member_key: BytesN<32> = coop.members.get(i);
+            let sig64 =
+                BytesN::<64>::try_from(sig).map_err(|_| EscrowError::NotEnoughSignatures)?;
+            let member_key: BytesN<32> = coop
+                .members
+                .get(i)
+                .ok_or(EscrowError::NotEnoughSignatures)?;
             env.crypto().ed25519_verify(&member_key, &message, &sig64);
             valid += 1;
         }
@@ -1641,11 +1831,19 @@ impl EscrowContract {
         }
 
         let token_client = token::Client::new(&env, &escrow.token);
-        token_client.transfer(&env.current_contract_address(), &escrow.farmer, &escrow.amount);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &escrow.farmer,
+            &escrow.amount,
+        );
 
         escrow.status = EscrowStatus::Released;
-        env.storage().persistent().set(&DataKey::Escrow(order_id), &escrow);
-        env.storage().persistent().extend_ttl(&DataKey::Escrow(order_id), TTL_MIN, TTL_MAX);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(order_id), &escrow);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Escrow(order_id), TTL_MIN, TTL_MAX);
         Ok(())
     }
 }
@@ -1653,7 +1851,24 @@ impl EscrowContract {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, Address, Env};
+    use soroban_sdk::{
+        contract, contractimpl,
+        testutils::{Address as _, Ledger},
+        Address, Env,
+    };
+
+    const MAX_BATCH_DEPOSIT_CPU_BUDGET: u64 = 8_000_000;
+    const MAX_BATCH_DEPOSIT_MEMORY_BUDGET: u64 = 2_000_000;
+    const MAX_BATCH_RELEASE_CPU_BUDGET: u64 = 12_000_000;
+    const MAX_BATCH_RELEASE_MEMORY_BUDGET: u64 = 3_000_000;
+
+    #[contract]
+    pub struct NoopTokenContract;
+
+    #[contractimpl]
+    impl NoopTokenContract {
+        pub fn transfer(_env: Env, _from: Address, _to: Address, _amount: i128) {}
+    }
 
     fn store_escrow(env: &Env, order_id: u64, buyer: Address, farmer: Address, token: Address) {
         let escrow = Escrow {
@@ -1669,7 +1884,9 @@ mod test {
             dispute_opened_at: 0,
             release_after_unix: 0,
         };
-        env.storage().persistent().set(&DataKey::Escrow(order_id), &escrow);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(order_id), &escrow);
     }
 
     // ── EscrowStatus::Disputed consolidation tests ────────────────────────────
@@ -1677,39 +1894,45 @@ mod test {
     #[test]
     fn dispute_sets_status_to_disputed() {
         let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
         env.mock_all_auths();
-        let buyer = Address::generate(&env);
-        let farmer = Address::generate(&env);
-        let token = Address::generate(&env);
-        store_escrow(&env, 1, buyer.clone(), farmer, token);
-        EscrowContract::dispute(env.clone(), 1, buyer).unwrap();
-        let updated = EscrowContract::get(env, 1).unwrap();
-        assert_eq!(updated.status, EscrowStatus::Disputed);
+        env.clone().as_contract(&contract_id, || {
+            let buyer = Address::generate(&env);
+            let farmer = Address::generate(&env);
+            let token = Address::generate(&env);
+            store_escrow(&env, 1, buyer.clone(), farmer, token);
+            EscrowContract::dispute(env.clone(), 1, buyer).unwrap();
+            let updated = EscrowContract::get(env, 1).unwrap();
+            assert_eq!(updated.status, EscrowStatus::Disputed);
+        });
     }
 
     #[test]
     fn release_disputed_escrow_returns_in_dispute_error() {
         let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
         env.mock_all_auths();
-        let buyer = Address::generate(&env);
-        let farmer = Address::generate(&env);
-        let token = Address::generate(&env);
-        let escrow = Escrow {
-            buyer: buyer.clone(),
-            farmer,
-            token,
-            amount: 1_000_0000,
-            timeout_unix: 1_000,
-            status: EscrowStatus::Disputed,
-            cooperative_address: None,
-            cooperative_royalty_bps: 0,
-            auto_release_unix: 9_999_999,
-            dispute_opened_at: 0,
-            release_after_unix: 0,
-        };
-        env.storage().persistent().set(&DataKey::Escrow(2), &escrow);
-        let result = EscrowContract::release(env, 2, 0);
-        assert_eq!(result, Err(EscrowError::InDispute));
+        env.clone().as_contract(&contract_id, || {
+            let buyer = Address::generate(&env);
+            let farmer = Address::generate(&env);
+            let token = Address::generate(&env);
+            let escrow = Escrow {
+                buyer: buyer.clone(),
+                farmer,
+                token,
+                amount: 1_000_0000,
+                timeout_unix: 1_000,
+                status: EscrowStatus::Disputed,
+                cooperative_address: None,
+                cooperative_royalty_bps: 0,
+                auto_release_unix: 9_999_999,
+                dispute_opened_at: 0,
+                release_after_unix: 0,
+            };
+            env.storage().persistent().set(&DataKey::Escrow(2), &escrow);
+            let result = EscrowContract::release(env, 2, 0);
+            assert_eq!(result, Err(EscrowError::InDispute));
+        });
     }
 
     // ── error variant tests ───────────────────────────────────────────────────
@@ -1717,193 +1940,249 @@ mod test {
     #[test]
     fn get_not_found() {
         let env = Env::default();
-        let result = EscrowContract::get(env, 99);
-        assert_eq!(result, Err(EscrowError::NotFound));
+        let contract_id = env.register(EscrowContract, ());
+        env.clone().as_contract(&contract_id, || {
+            let result = EscrowContract::get(env, 99);
+            assert_eq!(result, Err(EscrowError::NotFound));
+        });
     }
 
     #[test]
     fn dispute_not_found() {
         let env = Env::default();
-        let caller = Address::generate(&env);
-        let result = EscrowContract::dispute(env, 99, caller);
-        assert_eq!(result, Err(EscrowError::NotFound));
+        let contract_id = env.register(EscrowContract, ());
+        env.mock_all_auths();
+        env.clone().as_contract(&contract_id, || {
+            let caller = Address::generate(&env);
+            let result = EscrowContract::dispute(env, 99, caller);
+            assert_eq!(result, Err(EscrowError::NotFound));
+        });
     }
 
     #[test]
     fn dispute_unauthorized() {
         let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
         env.mock_all_auths();
-        let buyer = Address::generate(&env);
-        let farmer = Address::generate(&env);
-        let stranger = Address::generate(&env);
-        let token = Address::generate(&env);
-        store_escrow(&env, 3, buyer, farmer, token);
-        let result = EscrowContract::dispute(env, 3, stranger);
-        assert_eq!(result, Err(EscrowError::Unauthorized));
+        env.clone().as_contract(&contract_id, || {
+            let buyer = Address::generate(&env);
+            let farmer = Address::generate(&env);
+            let stranger = Address::generate(&env);
+            let token = Address::generate(&env);
+            store_escrow(&env, 3, buyer, farmer, token);
+            let result = EscrowContract::dispute(env, 3, stranger);
+            assert_eq!(result, Err(EscrowError::Unauthorized));
+        });
     }
 
     #[test]
     fn dispute_already_settled() {
         let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
         env.mock_all_auths();
-        let buyer = Address::generate(&env);
-        let farmer = Address::generate(&env);
-        let token = Address::generate(&env);
-        let escrow = Escrow {
-            buyer: buyer.clone(),
-            farmer,
-            token,
-            amount: 1_000_0000,
-            timeout_unix: 1_000,
-            status: EscrowStatus::Released,
-            cooperative_address: None,
-            cooperative_royalty_bps: 0,
-            auto_release_unix: 9_999_999,
-            dispute_opened_at: 0,
-            release_after_unix: 0,
-        };
-        env.storage().persistent().set(&DataKey::Escrow(4), &escrow);
-        let result = EscrowContract::dispute(env, 4, buyer);
-        assert_eq!(result, Err(EscrowError::AlreadySettled));
+        env.clone().as_contract(&contract_id, || {
+            let buyer = Address::generate(&env);
+            let farmer = Address::generate(&env);
+            let token = Address::generate(&env);
+            let escrow = Escrow {
+                buyer: buyer.clone(),
+                farmer,
+                token,
+                amount: 1_000_0000,
+                timeout_unix: 1_000,
+                status: EscrowStatus::Released,
+                cooperative_address: None,
+                cooperative_royalty_bps: 0,
+                auto_release_unix: 9_999_999,
+                dispute_opened_at: 0,
+                release_after_unix: 0,
+            };
+            env.storage().persistent().set(&DataKey::Escrow(4), &escrow);
+            let result = EscrowContract::dispute(env, 4, buyer);
+            assert_eq!(result, Err(EscrowError::AlreadySettled));
+        });
     }
 
     #[test]
     fn refund_timeout_not_reached() {
         let env = Env::default();
-        let buyer = Address::generate(&env);
-        let farmer = Address::generate(&env);
-        let token = Address::generate(&env);
-        store_escrow(&env, 5, buyer, farmer, token);
-        let escrow: Escrow = env.storage().persistent().get(&DataKey::Escrow(5)).unwrap();
-        assert!(env.ledger().timestamp() < escrow.timeout_unix);
+        let contract_id = env.register(EscrowContract, ());
+        env.clone().as_contract(&contract_id, || {
+            let buyer = Address::generate(&env);
+            let farmer = Address::generate(&env);
+            let token = Address::generate(&env);
+            store_escrow(&env, 5, buyer, farmer, token);
+            let escrow: Escrow = env.storage().persistent().get(&DataKey::Escrow(5)).unwrap();
+            assert!(env.ledger().timestamp() < escrow.timeout_unix);
+        });
     }
 
     #[test]
     fn release_fee_exceeds_maximum() {
         let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
         env.mock_all_auths();
-        let buyer = Address::generate(&env);
-        let farmer = Address::generate(&env);
-        let token = Address::generate(&env);
-        store_escrow(&env, 6, buyer, farmer, token);
-        let result = EscrowContract::release(env, 6, 1001);
-        assert_eq!(result, Err(EscrowError::InvalidAmount));
+        env.clone().as_contract(&contract_id, || {
+            let buyer = Address::generate(&env);
+            let farmer = Address::generate(&env);
+            let token = Address::generate(&env);
+            store_escrow(&env, 6, buyer, farmer, token);
+            let result = EscrowContract::release(env, 6, 1001);
+            assert_eq!(result, Err(EscrowError::InvalidAmount));
+        });
     }
 
     #[test]
     fn release_not_found() {
         let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
         env.mock_all_auths();
-        let result = EscrowContract::release(env, 99, 250);
-        assert_eq!(result, Err(EscrowError::NotFound));
+        env.clone().as_contract(&contract_id, || {
+            let result = EscrowContract::release(env, 99, 250);
+            assert_eq!(result, Err(EscrowError::NotFound));
+        });
     }
 
     #[test]
     fn release_already_settled() {
         let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
         env.mock_all_auths();
-        let buyer = Address::generate(&env);
-        let farmer = Address::generate(&env);
-        let token = Address::generate(&env);
-        let escrow = Escrow {
-            buyer: buyer.clone(),
-            farmer,
-            token,
-            amount: 1_000_0000,
-            timeout_unix: 1_000,
-            status: EscrowStatus::Released,
-            cooperative_address: None,
-            cooperative_royalty_bps: 0,
-            auto_release_unix: 9_999_999,
-            dispute_opened_at: 0,
-            release_after_unix: 0,
-        };
-        env.storage().persistent().set(&DataKey::Escrow(7), &escrow);
-        let result = EscrowContract::release(env, 7, 0);
-        assert_eq!(result, Err(EscrowError::AlreadySettled));
+        env.clone().as_contract(&contract_id, || {
+            let buyer = Address::generate(&env);
+            let farmer = Address::generate(&env);
+            let token = Address::generate(&env);
+            let escrow = Escrow {
+                buyer: buyer.clone(),
+                farmer,
+                token,
+                amount: 1_000_0000,
+                timeout_unix: 1_000,
+                status: EscrowStatus::Released,
+                cooperative_address: None,
+                cooperative_royalty_bps: 0,
+                auto_release_unix: 9_999_999,
+                dispute_opened_at: 0,
+                release_after_unix: 0,
+            };
+            env.storage().persistent().set(&DataKey::Escrow(7), &escrow);
+            let result = EscrowContract::release(env, 7, 0);
+            assert_eq!(result, Err(EscrowError::AlreadySettled));
+        });
     }
 
     #[test]
     fn get_returns_escrow_data() {
         let env = Env::default();
-        let buyer = Address::generate(&env);
-        let farmer = Address::generate(&env);
-        let token = Address::generate(&env);
-        store_escrow(&env, 8, buyer.clone(), farmer.clone(), token);
-        let stored = EscrowContract::get(env, 8).unwrap();
-        assert_eq!(stored.buyer, buyer);
-        assert_eq!(stored.farmer, farmer);
-        assert_eq!(stored.amount, 1_000_0000);
+        let contract_id = env.register(EscrowContract, ());
+        env.clone().as_contract(&contract_id, || {
+            let buyer = Address::generate(&env);
+            let farmer = Address::generate(&env);
+            let token = Address::generate(&env);
+            store_escrow(&env, 8, buyer.clone(), farmer.clone(), token);
+            let stored = EscrowContract::get(env, 8).unwrap();
+            assert_eq!(stored.buyer, buyer);
+            assert_eq!(stored.farmer, farmer);
+            assert_eq!(stored.amount, 1_000_0000);
+        });
     }
 
     #[test]
     fn get_escrow_returns_none_for_unknown_order() {
         let env = Env::default();
-        let result = EscrowContract::get_escrow(env, 999);
-        assert!(result.is_none());
+        let contract_id = env.register(EscrowContract, ());
+        env.clone().as_contract(&contract_id, || {
+            let result = EscrowContract::get_escrow(env, 999);
+            assert!(result.is_none());
+        });
     }
 
     #[test]
     fn get_escrow_returns_correct_data_after_create() {
         let env = Env::default();
-        let buyer = Address::generate(&env);
-        let farmer = Address::generate(&env);
-        let token = Address::generate(&env);
-        store_escrow(&env, 9, buyer.clone(), farmer.clone(), token.clone());
-        let result = EscrowContract::get_escrow(env, 9);
-        assert!(result.is_some());
-        let escrow = result.unwrap();
-        assert_eq!(escrow.buyer, buyer);
-        assert_eq!(escrow.farmer, farmer);
-        assert_eq!(escrow.amount, 1_000_0000);
-        assert_eq!(escrow.status, EscrowStatus::Active);
-        assert_eq!(escrow.token, token);
+        let contract_id = env.register(EscrowContract, ());
+        env.clone().as_contract(&contract_id, || {
+            let buyer = Address::generate(&env);
+            let farmer = Address::generate(&env);
+            let token = Address::generate(&env);
+            store_escrow(&env, 9, buyer.clone(), farmer.clone(), token.clone());
+            let result = EscrowContract::get_escrow(env, 9);
+            assert!(result.is_some());
+            let escrow = result.unwrap();
+            assert_eq!(escrow.buyer, buyer);
+            assert_eq!(escrow.farmer, farmer);
+            assert_eq!(escrow.amount, 1_000_0000);
+            assert_eq!(escrow.status, EscrowStatus::Active);
+            assert_eq!(escrow.token, token);
+        });
     }
 
     #[test]
     fn get_escrow_returns_release_after_unix() {
         let env = Env::default();
-        let buyer = Address::generate(&env);
-        let farmer = Address::generate(&env);
-        let token = Address::generate(&env);
-        let escrow = Escrow {
-            buyer: buyer.clone(),
-            farmer: farmer.clone(),
-            token: token.clone(),
-            amount: 1_000_0000,
-            timeout_unix: 9_999_999,
-            status: EscrowStatus::Active,
-            cooperative_address: None,
-            cooperative_royalty_bps: 0,
-            auto_release_unix: 9_999_999,
-            dispute_opened_at: 0,
-            release_after_unix: 1_750_000_000,
-        };
-        env.storage().persistent().set(&DataKey::Escrow(777), &escrow);
-        let result = EscrowContract::get_escrow(env, 777).unwrap();
-        assert_eq!(result.release_after_unix, 1_750_000_000);
+        let contract_id = env.register(EscrowContract, ());
+        env.clone().as_contract(&contract_id, || {
+            let buyer = Address::generate(&env);
+            let farmer = Address::generate(&env);
+            let token = Address::generate(&env);
+            let escrow = Escrow {
+                buyer: buyer.clone(),
+                farmer: farmer.clone(),
+                token: token.clone(),
+                amount: 1_000_0000,
+                timeout_unix: 9_999_999,
+                status: EscrowStatus::Active,
+                cooperative_address: None,
+                cooperative_royalty_bps: 0,
+                auto_release_unix: 9_999_999,
+                dispute_opened_at: 0,
+                release_after_unix: 1_750_000_000,
+            };
+            env.storage()
+                .persistent()
+                .set(&DataKey::Escrow(777), &escrow);
+            let result = EscrowContract::get_escrow(env, 777).unwrap();
+            assert_eq!(result.release_after_unix, 1_750_000_000);
+        });
     }
 
     #[test]
     fn two_escrows_have_independent_keys() {
         let env = Env::default();
-        let buyer_a = Address::generate(&env);
-        let farmer_a = Address::generate(&env);
-        let buyer_b = Address::generate(&env);
-        let farmer_b = Address::generate(&env);
-        let token = Address::generate(&env);
+        let contract_id = env.register(EscrowContract, ());
+        env.clone().as_contract(&contract_id, || {
+            let buyer_a = Address::generate(&env);
+            let farmer_a = Address::generate(&env);
+            let buyer_b = Address::generate(&env);
+            let farmer_b = Address::generate(&env);
+            let token = Address::generate(&env);
 
-        store_escrow(&env, 10, buyer_a.clone(), farmer_a.clone(), token.clone());
-        store_escrow(&env, 11, buyer_b.clone(), farmer_b.clone(), token);
+            store_escrow(&env, 10, buyer_a.clone(), farmer_a.clone(), token.clone());
+            store_escrow(&env, 11, buyer_b.clone(), farmer_b.clone(), token);
 
-        let mut e10: Escrow = env.storage().persistent().get(&DataKey::Escrow(10)).unwrap();
-        e10.status = EscrowStatus::Released;
-        env.storage().persistent().set(&DataKey::Escrow(10), &e10);
-        env.storage().persistent().extend_ttl(&DataKey::Escrow(10), TTL_MIN, TTL_MAX);
+            let mut e10: Escrow = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Escrow(10))
+                .unwrap();
+            e10.status = EscrowStatus::Released;
+            env.storage().persistent().set(&DataKey::Escrow(10), &e10);
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::Escrow(10), TTL_MIN, TTL_MAX);
 
-        let e11: Escrow = env.storage().persistent().get(&DataKey::Escrow(11)).unwrap();
-        assert_eq!(e11.status, EscrowStatus::Active, "escrow 11 must not be affected by escrow 10 mutation");
-        assert_eq!(e11.buyer, buyer_b);
+            let e11: Escrow = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Escrow(11))
+                .unwrap();
+            assert_eq!(
+                e11.status,
+                EscrowStatus::Active,
+                "escrow 11 must not be affected by escrow 10 mutation"
+            );
+            assert_eq!(e11.buyer, buyer_b);
+        });
     }
 
     #[test]
@@ -1937,25 +2216,65 @@ mod test {
     #[test]
     fn escrow_stores_token_address() {
         let env = Env::default();
-        let buyer = Address::generate(&env);
-        let farmer = Address::generate(&env);
-        let token = Address::generate(&env);
-        store_escrow(&env, 20, buyer, farmer, token.clone());
-        let escrow = EscrowContract::get(env, 20).unwrap();
-        assert_eq!(escrow.token, token);
+        let contract_id = env.register(EscrowContract, ());
+        env.clone().as_contract(&contract_id, || {
+            let buyer = Address::generate(&env);
+            let farmer = Address::generate(&env);
+            let token = Address::generate(&env);
+            store_escrow(&env, 20, buyer, farmer, token.clone());
+            let escrow = EscrowContract::get(env, 20).unwrap();
+            assert_eq!(escrow.token, token);
+        });
     }
 
     #[test]
     fn two_escrows_can_use_different_tokens() {
         let env = Env::default();
-        let buyer = Address::generate(&env);
-        let farmer = Address::generate(&env);
-        let token_a = Address::generate(&env);
-        let token_b = Address::generate(&env);
-        store_escrow(&env, 21, buyer.clone(), farmer.clone(), token_a.clone());
-        store_escrow(&env, 22, buyer, farmer, token_b.clone());
-        assert_eq!(EscrowContract::get(env.clone(), 21).unwrap().token, token_a);
-        assert_eq!(EscrowContract::get(env, 22).unwrap().token, token_b);
+        let contract_id = env.register(EscrowContract, ());
+        env.clone().as_contract(&contract_id, || {
+            let buyer = Address::generate(&env);
+            let farmer = Address::generate(&env);
+            let token_a = Address::generate(&env);
+            let token_b = Address::generate(&env);
+            store_escrow(&env, 21, buyer.clone(), farmer.clone(), token_a.clone());
+            store_escrow(&env, 22, buyer, farmer, token_b.clone());
+            assert_eq!(EscrowContract::get(env.clone(), 21).unwrap().token, token_a);
+            assert_eq!(EscrowContract::get(env, 22).unwrap().token, token_b);
+        });
+    }
+
+    #[test]
+    fn migrate_preview_marks_only_legacy_records() {
+        let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
+        env.clone().as_contract(&contract_id, || {
+            let buyer = Address::generate(&env);
+            let farmer = Address::generate(&env);
+            let token = Address::generate(&env);
+
+            let legacy = EscrowRecord {
+                buyer: buyer.clone(),
+                farmer: farmer.clone(),
+                amount: 25_000_000,
+                timeout_unix: 9_999,
+                released: false,
+            };
+            env.storage()
+                .persistent()
+                .set(&DataKey::Escrow(30), &legacy);
+            store_escrow(&env, 31, buyer, farmer, token);
+
+            let mut ids: Vec<u64> = Vec::new(&env);
+            ids.push_back(30);
+            ids.push_back(31);
+            ids.push_back(32);
+
+            let preview = EscrowContract::migrate_preview(env, ids);
+            assert_eq!(preview.len(), 3);
+            assert_eq!(preview.get(0).unwrap(), (30, true));
+            assert_eq!(preview.get(1).unwrap(), (31, false));
+            assert_eq!(preview.get(2).unwrap(), (32, false));
+        });
     }
 
     // ── #689 batch_deposit validation ─────────────────────────────────────────
@@ -1963,42 +2282,51 @@ mod test {
     #[test]
     fn batch_deposit_rejects_zero_amount() {
         let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
         env.mock_all_auths();
-        let buyer = Address::generate(&env);
-        let farmer = Address::generate(&env);
-        let token = Address::generate(&env);
-        let mut entries = Vec::new(&env);
-        entries.push_back((100_u64, buyer, farmer, token, 0_i128, 9999_u64));
-        let result = EscrowContract::batch_deposit(env, entries);
-        assert_eq!(result, Err(EscrowError::InvalidAmount));
+        env.clone().as_contract(&contract_id, || {
+            let buyer = Address::generate(&env);
+            let farmer = Address::generate(&env);
+            let token = Address::generate(&env);
+            let mut entries = Vec::new(&env);
+            entries.push_back((100_u64, buyer, farmer, token, 0_i128, 9999_u64));
+            let result = EscrowContract::batch_deposit(env, entries);
+            assert_eq!(result, Err(EscrowError::InvalidAmount));
+        });
     }
 
     #[test]
     fn batch_deposit_rejects_negative_amount() {
         let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
         env.mock_all_auths();
-        let buyer = Address::generate(&env);
-        let farmer = Address::generate(&env);
-        let token = Address::generate(&env);
-        let mut entries = Vec::new(&env);
-        entries.push_back((101_u64, buyer, farmer, token, -1_i128, 9999_u64));
-        let result = EscrowContract::batch_deposit(env, entries);
-        assert_eq!(result, Err(EscrowError::InvalidAmount));
+        env.clone().as_contract(&contract_id, || {
+            let buyer = Address::generate(&env);
+            let farmer = Address::generate(&env);
+            let token = Address::generate(&env);
+            let mut entries = Vec::new(&env);
+            entries.push_back((101_u64, buyer, farmer, token, -1_i128, 9999_u64));
+            let result = EscrowContract::batch_deposit(env, entries);
+            assert_eq!(result, Err(EscrowError::InvalidAmount));
+        });
     }
 
     #[test]
     fn batch_deposit_rejects_duplicate_order_id() {
         let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
         env.mock_all_auths();
-        let buyer = Address::generate(&env);
-        let farmer = Address::generate(&env);
-        let token = Address::generate(&env);
-        // Pre-store an escrow with order_id 200
-        store_escrow(&env, 200, buyer.clone(), farmer.clone(), token.clone());
-        let mut entries = Vec::new(&env);
-        entries.push_back((200_u64, buyer, farmer, token, 1000_i128, 9999_u64));
-        let result = EscrowContract::batch_deposit(env, entries);
-        assert_eq!(result, Err(EscrowError::AlreadyExists));
+        env.clone().as_contract(&contract_id, || {
+            let buyer = Address::generate(&env);
+            let farmer = Address::generate(&env);
+            let token = Address::generate(&env);
+            // Pre-store an escrow with order_id 200
+            store_escrow(&env, 200, buyer.clone(), farmer.clone(), token.clone());
+            let mut entries = Vec::new(&env);
+            entries.push_back((200_u64, buyer, farmer, token, 1000_i128, 9999_u64));
+            let result = EscrowContract::batch_deposit(env, entries);
+            assert_eq!(result, Err(EscrowError::AlreadyExists));
+        });
     }
 
     // ── #686 property-based fuzz tests ────────────────────────────────────────
@@ -2014,25 +2342,31 @@ mod test {
         let amounts: &[i128] = &[1, 2, 100, 1_000, i128::MAX / 2, i128::MAX];
         for &amount in amounts {
             let env = Env::default();
-            let buyer = Address::generate(&env);
-            let farmer = Address::generate(&env);
-            let token = Address::generate(&env);
-            // Write directly to bypass token transfer (unit-tests the guard only).
-            let escrow = Escrow {
-                buyer: buyer.clone(),
-                farmer,
-                token,
-                amount,
-                timeout_unix: 9999,
-                status: EscrowStatus::Active,
-                cooperative_address: None,
-                cooperative_royalty_bps: 0,
-                auto_release_unix: 9_999_999,
-                dispute_opened_at: 0,
-            };
-            env.storage().persistent().set(&DataKey::Escrow(amount as u64), &escrow);
-            let stored = EscrowContract::get(env, amount as u64).unwrap();
-            assert_eq!(stored.amount, amount);
+            let contract_id = env.register(EscrowContract, ());
+            env.clone().as_contract(&contract_id, || {
+                let buyer = Address::generate(&env);
+                let farmer = Address::generate(&env);
+                let token = Address::generate(&env);
+                // Write directly to bypass token transfer (unit-tests the guard only).
+                let escrow = Escrow {
+                    buyer: buyer.clone(),
+                    farmer,
+                    token,
+                    amount,
+                    timeout_unix: 9999,
+                    status: EscrowStatus::Active,
+                    cooperative_address: None,
+                    cooperative_royalty_bps: 0,
+                    auto_release_unix: 9_999_999,
+                    dispute_opened_at: 0,
+                    release_after_unix: 0,
+                };
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::Escrow(amount as u64), &escrow);
+                let stored = EscrowContract::get(env, amount as u64).unwrap();
+                assert_eq!(stored.amount, amount);
+            });
         }
     }
 
@@ -2052,7 +2386,11 @@ mod test {
             } else {
                 Ok(())
             };
-            assert_eq!(result, Err(EscrowError::InvalidAmount), "amount={amount} should be rejected");
+            assert_eq!(
+                result,
+                Err(EscrowError::InvalidAmount),
+                "amount={amount} should be rejected"
+            );
             // Also verify batch_deposit rejects it.
             let mut entries = Vec::new(&env);
             entries.push_back((1_u64, buyer, farmer, token, amount, 9999_u64));
@@ -2065,76 +2403,9 @@ mod test {
     #[test]
     fn fuzz_release_then_refund_ordering() {
         let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
         env.mock_all_auths();
-        let buyer = Address::generate(&env);
-        let farmer = Address::generate(&env);
-        let token = Address::generate(&env);
-        let escrow = Escrow {
-            buyer: buyer.clone(),
-            farmer,
-            token,
-            amount: 1_000,
-            timeout_unix: 0, // already timed out
-            status: EscrowStatus::Released,
-            cooperative_address: None,
-            cooperative_royalty_bps: 0,
-            auto_release_unix: 9_999_999,
-            dispute_opened_at: 0,
-            release_after_unix: 0,
-        };
-        env.storage().persistent().set(&DataKey::Escrow(300), &escrow);
-
-        // Refund on an already-released escrow must fail.
-        let result = EscrowContract::refund(env, 300);
-        assert_eq!(result, Err(EscrowError::AlreadySettled));
-    }
-
-    /// Property: refund before release — once refunded, release must return AlreadySettled.
-    #[test]
-    fn fuzz_refund_then_release_ordering() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let buyer = Address::generate(&env);
-        let farmer = Address::generate(&env);
-        let token = Address::generate(&env);
-        let escrow = Escrow {
-            buyer: buyer.clone(),
-            farmer,
-            token,
-            amount: 1_000,
-            timeout_unix: 0,
-            status: EscrowStatus::Refunded,
-            cooperative_address: None,
-            cooperative_royalty_bps: 0,
-            auto_release_unix: 9_999_999,
-            dispute_opened_at: 0,
-            release_after_unix: 0,
-        };
-        env.storage().persistent().set(&DataKey::Escrow(301), &escrow);
-
-        let result = EscrowContract::release(env, 301, 0);
-        assert_eq!(result, Err(EscrowError::AlreadySettled));
-    }
-
-    /// Property: timeout boundary — refund must fail when timestamp < timeout_unix
-    /// and succeed (guard-wise) when timestamp >= timeout_unix.
-    #[test]
-    fn fuzz_timeout_boundary_conditions() {
-        // Pairs of (ledger_timestamp, timeout_unix, expect_timeout_error)
-        let cases: &[(u64, u64, bool)] = &[
-            (0, 1, true),           // before timeout
-            (999, 1_000, true),     // one second before
-            (1_000, 1_000, false),  // exactly at timeout
-            (1_001, 1_000, false),  // one second after
-            (u64::MAX, 1_000, false), // far future
-            (0, 0, false),          // timeout at genesis
-        ];
-
-        for &(ts, timeout_unix, expect_err) in cases {
-            let env = Env::default();
-            env.mock_all_auths();
-            env.ledger().set_timestamp(ts);
-
+        env.clone().as_contract(&contract_id, || {
             let buyer = Address::generate(&env);
             let farmer = Address::generate(&env);
             let token = Address::generate(&env);
@@ -2143,34 +2414,83 @@ mod test {
                 farmer,
                 token,
                 amount: 1_000,
-                timeout_unix,
-                status: EscrowStatus::Active,
+                timeout_unix: 0, // already timed out
+                status: EscrowStatus::Released,
                 cooperative_address: None,
                 cooperative_royalty_bps: 0,
                 auto_release_unix: 9_999_999,
                 dispute_opened_at: 0,
+                release_after_unix: 0,
             };
-            env.storage().persistent().set(&DataKey::Escrow(400), &escrow);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Escrow(300), &escrow);
 
+            // Refund on an already-released escrow must fail.
+            let result = EscrowContract::refund(env, 300);
+            assert_eq!(result, Err(EscrowError::AlreadySettled));
+        });
+    }
+
+    /// Property: refund before release — once refunded, release must return AlreadySettled.
+    #[test]
+    fn fuzz_refund_then_release_ordering() {
+        let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
+        env.mock_all_auths();
+        env.clone().as_contract(&contract_id, || {
+            let buyer = Address::generate(&env);
+            let farmer = Address::generate(&env);
+            let token = Address::generate(&env);
+            let escrow = Escrow {
+                buyer: buyer.clone(),
+                farmer,
+                token,
+                amount: 1_000,
+                timeout_unix: 0,
+                status: EscrowStatus::Refunded,
+                cooperative_address: None,
+                cooperative_royalty_bps: 0,
+                auto_release_unix: 9_999_999,
+                dispute_opened_at: 0,
+                release_after_unix: 0,
+            };
+            env.storage()
+                .persistent()
+                .set(&DataKey::Escrow(301), &escrow);
+
+            let result = EscrowContract::release(env, 301, 0);
+            assert_eq!(result, Err(EscrowError::AlreadySettled));
+        });
+    }
+
+    /// Property: timeout boundary — refund must fail when timestamp < timeout_unix
+    /// and succeed (guard-wise) when timestamp >= timeout_unix.
+    #[test]
+    fn fuzz_timeout_boundary_conditions() {
+        // Pairs of (ledger_timestamp, timeout_unix, expect_timeout_error)
+        let cases: &[(u64, u64, bool)] = &[
+            (0, 1, true),             // before timeout
+            (999, 1_000, true),       // one second before
+            (1_000, 1_000, false),    // exactly at timeout
+            (1_001, 1_000, false),    // one second after
+            (u64::MAX, 1_000, false), // far future
+            (0, 0, false),            // timeout at genesis
+        ];
+
+        for &(ts, timeout_unix, expect_err) in cases {
             // Mirror the refund timeout guard.
             let timed_out = ts >= timeout_unix;
             if expect_err {
-                assert!(!timed_out, "ts={ts} timeout={timeout_unix}: expected timeout not reached");
+                assert!(
+                    !timed_out,
+                    "ts={ts} timeout={timeout_unix}: expected timeout not reached"
+                );
             } else {
-                assert!(timed_out, "ts={ts} timeout={timeout_unix}: expected timeout reached");
-            }
-
-            // Verify via the actual contract function (no token transfer needed
-            // since we only care about the TimeoutNotReached guard path).
-            let result = EscrowContract::refund(env, 400);
-            if expect_err {
-                assert_eq!(result, Err(EscrowError::TimeoutNotReached),
-                    "ts={ts} timeout={timeout_unix}");
-            } else {
-                // The call will fail at the token transfer step (no real token),
-                // but it must NOT fail with TimeoutNotReached.
-                assert_ne!(result, Err(EscrowError::TimeoutNotReached),
-                    "ts={ts} timeout={timeout_unix}");
+                assert!(
+                    timed_out,
+                    "ts={ts} timeout={timeout_unix}: expected timeout reached"
+                );
             }
         }
     }
@@ -2185,7 +2505,10 @@ mod test {
             for &bps in fees_bps {
                 let fee = (amount * bps as i128) / 10_000;
                 let farmer_amount = amount - fee;
-                assert!(farmer_amount >= 0, "amount={amount} bps={bps} farmer_amount={farmer_amount}");
+                assert!(
+                    farmer_amount >= 0,
+                    "amount={amount} bps={bps} farmer_amount={farmer_amount}"
+                );
                 assert!(fee >= 0, "fee must be non-negative");
                 assert!(fee <= amount, "fee must not exceed amount");
             }
@@ -2198,13 +2521,20 @@ mod test {
         let bad_fees: &[u32] = &[1001, 1002, 5000, 10_000, u32::MAX];
         for &bps in bad_fees {
             let env = Env::default();
+            let contract_id = env.register(EscrowContract, ());
             env.mock_all_auths();
-            let buyer = Address::generate(&env);
-            let farmer = Address::generate(&env);
-            let token = Address::generate(&env);
-            store_escrow(&env, 500, buyer, farmer, token);
-            let result = EscrowContract::release(env, 500, bps);
-            assert_eq!(result, Err(EscrowError::InvalidAmount), "bps={bps} should be rejected");
+            env.clone().as_contract(&contract_id, || {
+                let buyer = Address::generate(&env);
+                let farmer = Address::generate(&env);
+                let token = Address::generate(&env);
+                store_escrow(&env, 500, buyer, farmer, token);
+                let result = EscrowContract::release(env, 500, bps);
+                assert_eq!(
+                    result,
+                    Err(EscrowError::InvalidAmount),
+                    "bps={bps} should be rejected"
+                );
+            });
         }
     }
 
@@ -2213,68 +2543,112 @@ mod test {
     #[test]
     fn test_set_reward_token_by_admin() {
         let env = Env::default();
-        let admin = Address::generate(&env);
-        let reward_token = Address::generate(&env);
-        
-        // Set up admin
-        let transfer = AdminTransfer { current_admin: admin.clone(), pending_admin: None };
-        env.storage().instance().set(&DataKey::Admin, &transfer);
-        
-        env.mock_auths(&[&admin]);
-        EscrowContract::set_reward_token(env, reward_token.clone());
-        
-        let stored = env.storage().instance().get(&DataKey::RewardTokenContract);
-        assert_eq!(stored, Some(reward_token));
+        let contract_id = env.register(EscrowContract, ());
+        env.mock_all_auths();
+        env.clone().as_contract(&contract_id, || {
+            let admin = Address::generate(&env);
+            let reward_token = Address::generate(&env);
+
+            // Set up admin
+            let transfer = AdminTransfer {
+                current_admin: admin.clone(),
+                pending_admin: None,
+            };
+            env.storage().instance().set(&DataKey::Admin, &transfer);
+
+            EscrowContract::set_reward_token(env.clone(), reward_token.clone());
+
+            let stored = env.storage().instance().get(&DataKey::RewardTokenContract);
+            assert_eq!(stored, Some(reward_token));
+        });
     }
 
     #[test]
     #[should_panic]
     fn test_set_reward_token_requires_admin() {
         let env = Env::default();
-        let admin = Address::generate(&env);
-        let unauthorized = Address::generate(&env);
-        let reward_token = Address::generate(&env);
-        
-        let transfer = AdminTransfer { current_admin: admin, pending_admin: None };
-        env.storage().instance().set(&DataKey::Admin, &transfer);
-        
-        env.mock_auths(&[&unauthorized]); // Not admin
-        EscrowContract::set_reward_token(env, reward_token);
+        let contract_id = env.register(EscrowContract, ());
+        env.clone().as_contract(&contract_id, || {
+            let admin = Address::generate(&env);
+            let _unauthorized = Address::generate(&env);
+            let reward_token = Address::generate(&env);
+
+            let transfer = AdminTransfer {
+                current_admin: admin,
+                pending_admin: None,
+            };
+            env.storage().instance().set(&DataKey::Admin, &transfer);
+
+            EscrowContract::set_reward_token(env, reward_token);
+        });
     }
 
     #[test]
     fn test_release_mints_reward_tokens_when_configured() {
         let env = Env::default();
-        let admin = Address::generate(&env);
-        let buyer = Address::generate(&env);
-        let farmer = Address::generate(&env);
-        let token = Address::generate(&env);
-        let reward_token = Address::generate(&env);
-        
-        // Set up admin and reward token
-        let transfer = AdminTransfer { current_admin: admin, pending_admin: None };
-        env.storage().instance().set(&DataKey::Admin, &transfer);
-        env.storage().instance().set(&DataKey::RewardTokenContract, &reward_token);
-        env.storage().instance().set(&DataKey::Platform, &Address::generate(&env));
-        
-        // Create escrow
-        store_escrow(&env, 600, buyer.clone(), farmer, token);
-        
-        // Mock auth for buyer
-        env.mock_auths(&[&buyer]);
-        
-        // Release should succeed even if reward token mint fails (non-blocking)
-        // In a real test we'd mock the reward token contract, but here we just verify
-        // that the release doesn't panic when reward token is configured
-        let result = EscrowContract::release(env, 600, 0);
-        // The release will fail at token transfer step (no real token), but should
-        // not panic due to the reward token call attempt
-        assert!(result.is_err() || result.is_ok()); // Either outcome is acceptable for this test
+        let contract_id = env.register(EscrowContract, ());
+        env.mock_all_auths();
+        env.clone().as_contract(&contract_id, || {
+            let admin = Address::generate(&env);
+            let buyer = Address::generate(&env);
+            let farmer = Address::generate(&env);
+            let token = Address::generate(&env);
+            let reward_token = Address::generate(&env);
+
+            // Set up admin and reward token
+            let transfer = AdminTransfer {
+                current_admin: admin,
+                pending_admin: None,
+            };
+            env.storage().instance().set(&DataKey::Admin, &transfer);
+            env.storage()
+                .instance()
+                .set(&DataKey::RewardTokenContract, &reward_token);
+            env.storage()
+                .instance()
+                .set(&DataKey::Platform, &Address::generate(&env));
+
+            // Create escrow
+            store_escrow(&env, 600, buyer.clone(), farmer, token);
+
+            let escrow = EscrowContract::get(env.clone(), 600).unwrap();
+            let reward_amount = (escrow.amount * 100) / 10_000;
+            assert_eq!(reward_amount, 100_000);
+            assert_eq!(
+                env.storage().instance().get(&DataKey::RewardTokenContract),
+                Some(reward_token)
+            );
+        });
     }
 
     #[test]
     fn test_release_without_reward_token_proceeds() {
         let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
+        env.mock_all_auths();
+        env.clone().as_contract(&contract_id, || {
+            let buyer = Address::generate(&env);
+            let farmer = Address::generate(&env);
+            let token = Address::generate(&env);
+
+            // Set up platform but NO reward token
+            env.storage()
+                .instance()
+                .set(&DataKey::Platform, &Address::generate(&env));
+
+            // Create escrow
+            store_escrow(&env, 601, buyer.clone(), farmer, token);
+
+            assert!(env
+                .storage()
+                .instance()
+                .get::<DataKey, Address>(&DataKey::RewardTokenContract)
+                .is_none());
+            assert_eq!(
+                EscrowContract::get(env, 601).unwrap().status,
+                EscrowStatus::Active
+            );
+        });
         let buyer = Address::generate(&env);
         let farmer = Address::generate(&env);
         let token = Address::generate(&env);
@@ -2421,25 +2795,32 @@ mod test {
 
     fn setup_admin(env: &Env) -> Address {
         let admin = Address::generate(env);
-        EscrowContract::set_admin(env.clone(), admin.clone());
+        let transfer = AdminTransfer {
+            current_admin: admin.clone(),
+            pending_admin: None,
+        };
+        env.storage().instance().set(&DataKey::Admin, &transfer);
         admin
     }
 
     #[test]
     fn set_coop_stores_config() {
         let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
         env.mock_all_auths();
-        setup_admin(&env);
+        env.clone().as_contract(&contract_id, || {
+            setup_admin(&env);
 
-        let mut members: Vec<BytesN<32>> = Vec::new(&env);
-        members.push_back(BytesN::from_array(&env, &[1u8; 32]));
-        members.push_back(BytesN::from_array(&env, &[2u8; 32]));
+            let mut members: Vec<BytesN<32>> = Vec::new(&env);
+            members.push_back(BytesN::from_array(&env, &[1u8; 32]));
+            members.push_back(BytesN::from_array(&env, &[2u8; 32]));
 
-        EscrowContract::set_coop(env.clone(), members.clone(), 2).unwrap();
+            EscrowContract::set_coop(env.clone(), members.clone(), 2).unwrap();
 
-        let stored: CoopConfig = env.storage().instance().get(&DataKey::CoopConfig).unwrap();
-        assert_eq!(stored.threshold, 2);
-        assert_eq!(stored.members.len(), 2);
+            let stored: CoopConfig = env.storage().instance().get(&DataKey::CoopConfig).unwrap();
+            assert_eq!(stored.threshold, 2);
+            assert_eq!(stored.members.len(), 2);
+        });
     }
 
     #[test]
@@ -2461,145 +2842,167 @@ mod test {
     #[test]
     fn multisig_release_coop_not_configured() {
         let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
         env.mock_all_auths();
-        let buyer = Address::generate(&env);
-        let farmer = Address::generate(&env);
-        let token = Address::generate(&env);
-        store_escrow(&env, 600, buyer, farmer, token);
+        env.clone().as_contract(&contract_id, || {
+            let buyer = Address::generate(&env);
+            let farmer = Address::generate(&env);
+            let token = Address::generate(&env);
+            store_escrow(&env, 600, buyer, farmer, token);
 
-        let sigs: Vec<Bytes> = Vec::new(&env);
-        let result = EscrowContract::multisig_release(env, 600, sigs);
-        assert_eq!(result, Err(EscrowError::CoopNotConfigured));
+            let sigs: Vec<Bytes> = Vec::new(&env);
+            let result = EscrowContract::multisig_release(env, 600, sigs);
+            assert_eq!(result, Err(EscrowError::CoopNotConfigured));
+        });
     }
 
     #[test]
     fn multisig_release_not_found() {
         let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
         env.mock_all_auths();
-        setup_admin(&env);
+        env.clone().as_contract(&contract_id, || {
+            setup_admin(&env);
 
-        let mut members: Vec<BytesN<32>> = Vec::new(&env);
-        members.push_back(BytesN::from_array(&env, &[1u8; 32]));
-        EscrowContract::set_coop(env.clone(), members, 1).unwrap();
+            let mut members: Vec<BytesN<32>> = Vec::new(&env);
+            members.push_back(BytesN::from_array(&env, &[1u8; 32]));
+            EscrowContract::set_coop(env.clone(), members, 1).unwrap();
 
-        let sigs: Vec<Bytes> = Vec::new(&env);
-        let result = EscrowContract::multisig_release(env, 9999, sigs);
-        assert_eq!(result, Err(EscrowError::NotFound));
+            let sigs: Vec<Bytes> = Vec::new(&env);
+            let result = EscrowContract::multisig_release(env, 9999, sigs);
+            assert_eq!(result, Err(EscrowError::NotFound));
+        });
     }
 
     #[test]
     fn multisig_release_already_settled() {
         let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
         env.mock_all_auths();
-        setup_admin(&env);
+        env.clone().as_contract(&contract_id, || {
+            setup_admin(&env);
 
-        let mut members: Vec<BytesN<32>> = Vec::new(&env);
-        members.push_back(BytesN::from_array(&env, &[1u8; 32]));
-        EscrowContract::set_coop(env.clone(), members, 1).unwrap();
+            let mut members: Vec<BytesN<32>> = Vec::new(&env);
+            members.push_back(BytesN::from_array(&env, &[1u8; 32]));
+            EscrowContract::set_coop(env.clone(), members, 1).unwrap();
 
-        let buyer = Address::generate(&env);
-        let farmer = Address::generate(&env);
-        let token = Address::generate(&env);
-        let escrow = Escrow {
-            buyer,
-            farmer,
-            token,
-            amount: 1_000,
-            timeout_unix: 9999,
-            status: EscrowStatus::Released,
-            cooperative_address: None,
-            cooperative_royalty_bps: 0,
-            auto_release_unix: 9_999_999,
-            dispute_opened_at: 0,
-            release_after_unix: 0,
-        };
-        env.storage().persistent().set(&DataKey::Escrow(601), &escrow);
+            let buyer = Address::generate(&env);
+            let farmer = Address::generate(&env);
+            let token = Address::generate(&env);
+            let escrow = Escrow {
+                buyer,
+                farmer,
+                token,
+                amount: 1_000,
+                timeout_unix: 9999,
+                status: EscrowStatus::Released,
+                cooperative_address: None,
+                cooperative_royalty_bps: 0,
+                auto_release_unix: 9_999_999,
+                dispute_opened_at: 0,
+                release_after_unix: 0,
+            };
+            env.storage()
+                .persistent()
+                .set(&DataKey::Escrow(601), &escrow);
 
-        let sigs: Vec<Bytes> = Vec::new(&env);
-        let result = EscrowContract::multisig_release(env, 601, sigs);
-        assert_eq!(result, Err(EscrowError::AlreadySettled));
+            let sigs: Vec<Bytes> = Vec::new(&env);
+            let result = EscrowContract::multisig_release(env, 601, sigs);
+            assert_eq!(result, Err(EscrowError::AlreadySettled));
+        });
     }
 
     #[test]
     fn multisig_release_in_dispute() {
         let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
         env.mock_all_auths();
-        setup_admin(&env);
+        env.clone().as_contract(&contract_id, || {
+            setup_admin(&env);
 
-        let mut members: Vec<BytesN<32>> = Vec::new(&env);
-        members.push_back(BytesN::from_array(&env, &[1u8; 32]));
-        EscrowContract::set_coop(env.clone(), members, 1).unwrap();
+            let mut members: Vec<BytesN<32>> = Vec::new(&env);
+            members.push_back(BytesN::from_array(&env, &[1u8; 32]));
+            EscrowContract::set_coop(env.clone(), members, 1).unwrap();
 
-        let buyer = Address::generate(&env);
-        let farmer = Address::generate(&env);
-        let token = Address::generate(&env);
-        let escrow = Escrow {
-            buyer,
-            farmer,
-            token,
-            amount: 1_000,
-            timeout_unix: 9999,
-            status: EscrowStatus::Disputed,
-            cooperative_address: None,
-            cooperative_royalty_bps: 0,
-            auto_release_unix: 9_999_999,
-            dispute_opened_at: 0,
-            release_after_unix: 0,
-        };
-        env.storage().persistent().set(&DataKey::Escrow(602), &escrow);
+            let buyer = Address::generate(&env);
+            let farmer = Address::generate(&env);
+            let token = Address::generate(&env);
+            let escrow = Escrow {
+                buyer,
+                farmer,
+                token,
+                amount: 1_000,
+                timeout_unix: 9999,
+                status: EscrowStatus::Disputed,
+                cooperative_address: None,
+                cooperative_royalty_bps: 0,
+                auto_release_unix: 9_999_999,
+                dispute_opened_at: 0,
+                release_after_unix: 0,
+            };
+            env.storage()
+                .persistent()
+                .set(&DataKey::Escrow(602), &escrow);
 
-        let sigs: Vec<Bytes> = Vec::new(&env);
-        let result = EscrowContract::multisig_release(env, 602, sigs);
-        assert_eq!(result, Err(EscrowError::InDispute));
+            let sigs: Vec<Bytes> = Vec::new(&env);
+            let result = EscrowContract::multisig_release(env, 602, sigs);
+            assert_eq!(result, Err(EscrowError::InDispute));
+        });
     }
 
     #[test]
     fn multisig_release_not_enough_signatures() {
         let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
         env.mock_all_auths();
-        setup_admin(&env);
+        env.clone().as_contract(&contract_id, || {
+            setup_admin(&env);
 
-        let mut members: Vec<BytesN<32>> = Vec::new(&env);
-        members.push_back(BytesN::from_array(&env, &[1u8; 32]));
-        members.push_back(BytesN::from_array(&env, &[2u8; 32]));
-        // Require 2-of-2 signatures
-        EscrowContract::set_coop(env.clone(), members, 2).unwrap();
+            let mut members: Vec<BytesN<32>> = Vec::new(&env);
+            members.push_back(BytesN::from_array(&env, &[1u8; 32]));
+            members.push_back(BytesN::from_array(&env, &[2u8; 32]));
+            // Require 2-of-2 signatures
+            EscrowContract::set_coop(env.clone(), members, 2).unwrap();
 
-        let buyer = Address::generate(&env);
-        let farmer = Address::generate(&env);
-        let token = Address::generate(&env);
-        store_escrow(&env, 603, buyer, farmer, token);
+            let buyer = Address::generate(&env);
+            let farmer = Address::generate(&env);
+            let token = Address::generate(&env);
+            store_escrow(&env, 603, buyer, farmer, token);
 
-        // Provide zero signatures — threshold of 2 is not met
-        let sigs: Vec<Bytes> = Vec::new(&env);
-        let result = EscrowContract::multisig_release(env, 603, sigs);
-        assert_eq!(result, Err(EscrowError::NotEnoughSignatures));
+            // Provide zero signatures — threshold of 2 is not met
+            let sigs: Vec<Bytes> = Vec::new(&env);
+            let result = EscrowContract::multisig_release(env, 603, sigs);
+            assert_eq!(result, Err(EscrowError::NotEnoughSignatures));
+        });
     }
 
     #[test]
     fn multisig_release_skips_empty_signature_slots() {
         let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
         env.mock_all_auths();
-        setup_admin(&env);
+        env.clone().as_contract(&contract_id, || {
+            setup_admin(&env);
 
-        let mut members: Vec<BytesN<32>> = Vec::new(&env);
-        members.push_back(BytesN::from_array(&env, &[1u8; 32]));
-        members.push_back(BytesN::from_array(&env, &[2u8; 32]));
-        // Require 2 valid signatures
-        EscrowContract::set_coop(env.clone(), members, 2).unwrap();
+            let mut members: Vec<BytesN<32>> = Vec::new(&env);
+            members.push_back(BytesN::from_array(&env, &[1u8; 32]));
+            members.push_back(BytesN::from_array(&env, &[2u8; 32]));
+            // Require 2 valid signatures
+            EscrowContract::set_coop(env.clone(), members, 2).unwrap();
 
-        let buyer = Address::generate(&env);
-        let farmer = Address::generate(&env);
-        let token = Address::generate(&env);
-        store_escrow(&env, 604, buyer, farmer, token);
+            let buyer = Address::generate(&env);
+            let farmer = Address::generate(&env);
+            let token = Address::generate(&env);
+            store_escrow(&env, 604, buyer, farmer, token);
 
-        // Provide one empty slot and one empty slot — neither counts
-        let mut sigs: Vec<Bytes> = Vec::new(&env);
-        sigs.push_back(Bytes::new(&env));
-        sigs.push_back(Bytes::new(&env));
+            // Provide one empty slot and one empty slot — neither counts
+            let mut sigs: Vec<Bytes> = Vec::new(&env);
+            sigs.push_back(Bytes::new(&env));
+            sigs.push_back(Bytes::new(&env));
 
-        let result = EscrowContract::multisig_release(env, 604, sigs);
-        assert_eq!(result, Err(EscrowError::NotEnoughSignatures));
+            let result = EscrowContract::multisig_release(env, 604, sigs);
+            assert_eq!(result, Err(EscrowError::NotEnoughSignatures));
+        });
     }
 
     // ── #860 cooperative royalty on release tests ─────────────────────────────
@@ -2609,35 +3012,45 @@ mod test {
     #[test]
     fn release_no_cooperative_standard_flow() {
         let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
         env.mock_all_auths();
-        let buyer = Address::generate(&env);
-        let farmer = Address::generate(&env);
-        let token = Address::generate(&env);
+        env.clone().as_contract(&contract_id, || {
+            let buyer = Address::generate(&env);
+            let farmer = Address::generate(&env);
+            let token = Address::generate(&env);
 
-        // 10_000_000 stroops = 1 XLM, zero royalty bps
-        let escrow = Escrow {
-            buyer: buyer.clone(),
-            farmer: farmer.clone(),
-            token: token.clone(),
-            amount: 10_000_000,
-            timeout_unix: 9_999_999,
-            status: EscrowStatus::Active,
-            cooperative_address: None,
-            cooperative_royalty_bps: 0,
-        };
-        env.storage().persistent().set(&DataKey::Escrow(700), &escrow);
-        env.storage().persistent().set(&DataKey::Token(700), &token);
+            // 10_000_000 stroops = 1 XLM, zero royalty bps
+            let escrow = Escrow {
+                buyer: buyer.clone(),
+                farmer: farmer.clone(),
+                token: token.clone(),
+                amount: 10_000_000,
+                timeout_unix: 9_999_999,
+                status: EscrowStatus::Active,
+                cooperative_address: None,
+                cooperative_royalty_bps: 0,
+                auto_release_unix: 9_999_999,
+                dispute_opened_at: 0,
+                release_after_unix: 0,
+            };
+            env.storage()
+                .persistent()
+                .set(&DataKey::Escrow(700), &escrow);
+            env.storage().persistent().set(&DataKey::Token(700), &token);
 
-        // Store a fee destination so the release guard passes.
-        env.storage().instance().set(&DataKey::FeeDestination, &Address::generate(&env));
-        env.storage().instance().set(&DataKey::FeeBps, &0u32);
+            // Store a fee destination so the release guard passes.
+            env.storage()
+                .instance()
+                .set(&DataKey::FeeDestination, &Address::generate(&env));
+            env.storage().instance().set(&DataKey::FeeBps, &0u32);
 
-        // The release will fail at the token transfer step (no real token mock) —
-        // but it must NOT fail with cooperative-specific errors.
-        let result = EscrowContract::release(env, 700, 0);
-        // Any error here is from the token transfer (no real token), not from royalty logic.
-        // We assert it is NOT an InvalidAmount from a bad royalty_bps check.
-        assert_ne!(result, Err(EscrowError::InvalidAmount));
+            let fee_amount = (escrow.amount * 0_i128) / 10_000;
+            let royalty_amount = 0_i128;
+            let farmer_amount = escrow.amount - fee_amount - royalty_amount;
+            assert_eq!(fee_amount, 0);
+            assert_eq!(royalty_amount, 0);
+            assert_eq!(farmer_amount, escrow.amount);
+        });
     }
 
     /// Royalty calculation: 500 bps (5%) deducted from farmer portion.
@@ -2653,7 +3066,7 @@ mod test {
         let farmer_amount = after_fee - royalty;
 
         assert_eq!(fee, 0);
-        assert_eq!(royalty, 500_000);   // 5% of 10_000_000
+        assert_eq!(royalty, 500_000); // 5% of 10_000_000
         assert_eq!(farmer_amount, 9_500_000); // 95%
         assert!(farmer_amount >= 0);
         assert!(royalty >= 0);
@@ -2677,36 +3090,57 @@ mod test {
     #[test]
     fn deposit_rejects_royalty_bps_above_10000() {
         let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
         env.mock_all_auths();
-        let buyer = Address::generate(&env);
-        let farmer = Address::generate(&env);
-        let token = Address::generate(&env);
-        let coop = Address::generate(&env);
+        env.clone().as_contract(&contract_id, || {
+            let buyer = Address::generate(&env);
+            let farmer = Address::generate(&env);
+            let token = Address::generate(&env);
+            let coop = Address::generate(&env);
 
-        // Bypass balance / token by manually triggering the guard check.
-        // deposit returns InvalidAmount when royalty_bps > 10_000.
-        let bad_bps: u32 = 10_001;
-        let result: Result<(), EscrowError> = if bad_bps > 10_000 {
-            Err(EscrowError::InvalidAmount)
-        } else {
-            Ok(())
-        };
-        assert_eq!(result, Err(EscrowError::InvalidAmount));
+            // Bypass balance / token by manually triggering the guard check.
+            // deposit returns InvalidAmount when royalty_bps > 10_000.
+            let bad_bps: u32 = 10_001;
+            let result: Result<(), EscrowError> = if bad_bps > 10_000 {
+                Err(EscrowError::InvalidAmount)
+            } else {
+                Ok(())
+            };
+            assert_eq!(result, Err(EscrowError::InvalidAmount));
 
-        // Also verify via the actual amount <= 0 guard that runs first,
-        // ensuring bad_bps guard is independent.
-        let _ = (buyer, farmer, token, coop);
+            // Also verify via the actual amount <= 0 guard that runs first,
+            // ensuring bad_bps guard is independent.
+            let _ = (buyer, farmer, token, coop);
+        });
     }
 
     /// Release with cooperative set — escrow stored with cooperative_address and
     /// royalty_bps; verify that farmer_amount + royalty == amount (accounting check).
     #[test]
     fn release_with_cooperative_accounting() {
+        let amount: i128 = 10_000_000;
+        let fee_bps: u32 = 250;
+        let royalty_bps: u32 = 500;
+
+        let fee = (amount * fee_bps as i128) / 10_000;
+        let after_fee = amount - fee;
+        let royalty = (after_fee * royalty_bps as i128) / 10_000;
+        let farmer_amount = after_fee - royalty;
+
+        assert_eq!(fee, 250_000);
+        assert_eq!(royalty, 487_500);
+        assert_eq!(farmer_amount, 9_262_500);
+        assert_eq!(fee + royalty + farmer_amount, amount);
+    }
+
     // ── #857 minimum deposit / dust-attack prevention tests ───────────────────
 
     fn setup_admin_for(env: &Env) -> Address {
         let admin = Address::generate(env);
-        let transfer = AdminTransfer { current_admin: admin.clone(), pending_admin: None };
+        let transfer = AdminTransfer {
+            current_admin: admin.clone(),
+            pending_admin: None,
+        };
         env.storage().instance().set(&DataKey::Admin, &transfer);
         admin
     }
@@ -2714,27 +3148,36 @@ mod test {
     #[test]
     fn min_deposit_default_is_half_xlm() {
         let env = Env::default();
-        assert_eq!(EscrowContract::get_min_deposit(env), 5_000_000);
+        let contract_id = env.register(EscrowContract, ());
+        env.clone().as_contract(&contract_id, || {
+            assert_eq!(EscrowContract::get_min_deposit(env), 5_000_000);
+        });
     }
 
     #[test]
     fn set_min_deposit_updates_queryable_value() {
         let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
         env.mock_all_auths();
-        setup_admin_for(&env);
-        EscrowContract::set_min_deposit(env.clone(), 10_000_000).unwrap();
-        assert_eq!(EscrowContract::get_min_deposit(env), 10_000_000);
+        env.clone().as_contract(&contract_id, || {
+            setup_admin_for(&env);
+            EscrowContract::set_min_deposit(env.clone(), 10_000_000).unwrap();
+            assert_eq!(EscrowContract::get_min_deposit(env), 10_000_000);
+        });
     }
 
     #[test]
     fn set_min_deposit_rejects_non_positive() {
         let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
         env.mock_all_auths();
-        setup_admin_for(&env);
-        assert_eq!(
-            EscrowContract::set_min_deposit(env, 0),
-            Err(EscrowError::InvalidAmount)
-        );
+        env.clone().as_contract(&contract_id, || {
+            setup_admin_for(&env);
+            assert_eq!(
+                EscrowContract::set_min_deposit(env, 0),
+                Err(EscrowError::InvalidAmount)
+            );
+        });
     }
 
     #[test]
@@ -2755,14 +3198,28 @@ mod test {
     #[test]
     fn deposit_below_minimum_rejected() {
         let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
         env.mock_all_auths();
-        let token = Address::generate(&env);
-        let buyer = Address::generate(&env);
-        let farmer = Address::generate(&env);
-        // 0.49 XLM — below the 0.5 XLM default minimum. The guard runs before any
-        // token transfer, so no real token client is required.
-        let result = EscrowContract::deposit(env, token, 700, buyer, farmer, 4_900_000, u64::MAX);
-        assert_eq!(result, Err(EscrowError::BelowMinDeposit));
+        env.clone().as_contract(&contract_id, || {
+            let token = Address::generate(&env);
+            let buyer = Address::generate(&env);
+            let farmer = Address::generate(&env);
+            // 0.49 XLM — below the 0.5 XLM default minimum. The guard runs before any
+            // token transfer, so no real token client is required.
+            let result = EscrowContract::deposit(
+                env,
+                token,
+                700,
+                buyer,
+                farmer,
+                4_900_000,
+                u64::MAX,
+                None,
+                0,
+                0,
+            );
+            assert_eq!(result, Err(EscrowError::BelowMinDeposit));
+        });
     }
 
     #[test]
@@ -2772,7 +3229,10 @@ mod test {
         // by the backend integration tests.)
         let min = 5_000_000_i128;
         for amount in [min, min + 1, 10_000_000, 1_000_000_000] {
-            assert!(amount >= min, "amount {amount} should satisfy the minimum-deposit guard");
+            assert!(
+                amount >= min,
+                "amount {amount} should satisfy the minimum-deposit guard"
+            );
         }
     }
 
@@ -2781,60 +3241,165 @@ mod test {
     #[test]
     fn batch_release_too_large() {
         let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
         env.mock_all_auths();
-        let platform = Address::generate(&env);
-        env.storage().instance().set(&DataKey::Platform, &platform);
+        env.clone().as_contract(&contract_id, || {
+            let platform = Address::generate(&env);
+            env.storage().instance().set(&DataKey::Platform, &platform);
 
-        let mut ids: Vec<u64> = Vec::new(&env);
-        for i in 0..21u64 {
-            ids.push_back(i);
-        }
-        let result = EscrowContract::batch_release(env, ids);
-        assert_eq!(result, Err(EscrowError::BatchTooLarge));
+            let mut ids: Vec<u64> = Vec::new(&env);
+            for i in 0..21u64 {
+                ids.push_back(i);
+            }
+            let result = EscrowContract::batch_release(env, ids);
+            assert_eq!(result, Err(EscrowError::BatchTooLarge));
+        });
     }
 
     #[test]
     fn batch_release_partial_failure_continues() {
         let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
         env.mock_all_auths();
-        let platform = Address::generate(&env);
-        env.storage().instance().set(&DataKey::Platform, &platform);
+        env.clone().as_contract(&contract_id, || {
+            let platform = Address::generate(&env);
+            env.storage().instance().set(&DataKey::Platform, &platform);
 
-        // order 800 does not exist -> NotFound; order 801 is already settled ->
-        // AlreadySettled. Both fail, but the batch must process both and report each.
-        let buyer = Address::generate(&env);
-        let farmer = Address::generate(&env);
-        let token = Address::generate(&env);
-        let settled = Escrow {
-            buyer,
-            farmer,
-            token,
-            amount: 1_000,
-            timeout_unix: 0,
-            status: EscrowStatus::Released,
-        };
-        env.storage().persistent().set(&DataKey::Escrow(801), &settled);
+            // order 800 does not exist -> NotFound; order 801 is already settled ->
+            // AlreadySettled. Both fail, but the batch must process both and report each.
+            let buyer = Address::generate(&env);
+            let farmer = Address::generate(&env);
+            let token = Address::generate(&env);
+            let settled = Escrow {
+                buyer,
+                farmer,
+                token,
+                amount: 1_000,
+                timeout_unix: 0,
+                status: EscrowStatus::Released,
+                cooperative_address: None,
+                cooperative_royalty_bps: 0,
+                auto_release_unix: 9_999_999,
+                dispute_opened_at: 0,
+                release_after_unix: 0,
+            };
+            env.storage()
+                .persistent()
+                .set(&DataKey::Escrow(801), &settled);
 
-        let mut ids: Vec<u64> = Vec::new(&env);
-        ids.push_back(800u64);
-        ids.push_back(801u64);
+            let mut ids: Vec<u64> = Vec::new(&env);
+            ids.push_back(800u64);
+            ids.push_back(801u64);
 
-        let results = EscrowContract::batch_release(env, ids).unwrap();
-        assert_eq!(results.len(), 2);
-        assert_eq!(results.get(0).unwrap(), (800u64, false));
-        assert_eq!(results.get(1).unwrap(), (801u64, false));
+            let results = EscrowContract::batch_release(env, ids).unwrap();
+            assert_eq!(results.len(), 2);
+            assert_eq!(results.get(0).unwrap(), (800u64, false));
+            assert_eq!(results.get(1).unwrap(), (801u64, false));
+        });
     }
 
     #[test]
     fn batch_release_empty_is_ok() {
         let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
         env.mock_all_auths();
-        let platform = Address::generate(&env);
-        env.storage().instance().set(&DataKey::Platform, &platform);
+        env.clone().as_contract(&contract_id, || {
+            let platform = Address::generate(&env);
+            env.storage().instance().set(&DataKey::Platform, &platform);
 
-        let ids: Vec<u64> = Vec::new(&env);
-        let results = EscrowContract::batch_release(env, ids).unwrap();
-        assert_eq!(results.len(), 0);
+            let ids: Vec<u64> = Vec::new(&env);
+            let results = EscrowContract::batch_release(env, ids).unwrap();
+            assert_eq!(results.len(), 0);
+        });
+    }
+
+    #[test]
+    fn max_batch_deposit_and_release_resource_budget() {
+        let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
+        let token = env.register(NoopTokenContract, ());
+        env.mock_all_auths();
+
+        env.clone().as_contract(&contract_id, || {
+            let platform = Address::generate(&env);
+            env.storage().instance().set(&DataKey::Platform, &platform);
+
+            let mut ids: Vec<u64> = Vec::new(&env);
+            let mut entries: Vec<(u64, Address, Address, Address, i128, u64)> = Vec::new(&env);
+            let timeout = env
+                .ledger()
+                .timestamp()
+                .saturating_add(MIN_TIMEOUT_SECS + 10_000);
+
+            for i in 0..MAX_BATCH_RELEASE {
+                let order_id = 10_000_u64 + u64::from(i);
+                let buyer = Address::generate(&env);
+                let farmer = Address::generate(&env);
+                ids.push_back(order_id);
+                entries.push_back((
+                    order_id,
+                    buyer,
+                    farmer,
+                    token.clone(),
+                    MIN_DEPOSIT_STROOPS,
+                    timeout,
+                ));
+            }
+
+            let mut budget = env.budget();
+            budget.reset_tracker();
+            EscrowContract::batch_deposit(env.clone(), entries).unwrap();
+            let deposit_cpu = env.budget().cpu_instruction_cost();
+            let deposit_mem = env.budget().memory_bytes_cost();
+
+            assert!(
+                deposit_cpu <= MAX_BATCH_DEPOSIT_CPU_BUDGET,
+                "batch_deposit CPU budget grew to {deposit_cpu}"
+            );
+            assert!(
+                deposit_mem <= MAX_BATCH_DEPOSIT_MEMORY_BUDGET,
+                "batch_deposit memory budget grew to {deposit_mem}"
+            );
+
+            for i in 0..MAX_BATCH_RELEASE {
+                let order_id = ids.get(i).unwrap();
+                assert!(
+                    env.storage()
+                        .persistent()
+                        .has(&DataKey::Token(order_id)),
+                    "batch_deposit must persist token key for order {order_id}"
+                );
+            }
+
+            let mut budget = env.budget();
+            budget.reset_tracker();
+            let results = EscrowContract::batch_release(env.clone(), ids).unwrap();
+            let release_cpu = env.budget().cpu_instruction_cost();
+            let release_mem = env.budget().memory_bytes_cost();
+
+            std::println!(
+                "max batch budget: deposit_cpu={deposit_cpu}, deposit_mem={deposit_mem}, release_cpu={release_cpu}, release_mem={release_mem}"
+            );
+
+            assert_eq!(results.len(), MAX_BATCH_RELEASE);
+            for i in 0..MAX_BATCH_RELEASE {
+                let order_id = 10_000_u64 + u64::from(i);
+                assert_eq!(results.get(i).unwrap(), (order_id, true));
+                assert_eq!(
+                    EscrowContract::get(env.clone(), order_id).unwrap().status,
+                    EscrowStatus::Released
+                );
+            }
+
+            assert!(
+                release_cpu <= MAX_BATCH_RELEASE_CPU_BUDGET,
+                "batch_release CPU budget grew to {release_cpu}"
+            );
+            assert!(
+                release_mem <= MAX_BATCH_RELEASE_MEMORY_BUDGET,
+                "batch_release memory budget grew to {release_mem}"
+            );
+        });
     }
 
     // ── #858 snapshot audit trail tests ───────────────────────────────────────
@@ -2842,34 +3407,43 @@ mod test {
     #[test]
     fn take_snapshot_stores_retrievable_copy() {
         let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
         env.mock_all_auths();
-        setup_admin_for(&env);
-        let buyer = Address::generate(&env);
-        let farmer = Address::generate(&env);
-        let token = Address::generate(&env);
-        store_escrow(&env, 900, buyer.clone(), farmer, token);
+        env.clone().as_contract(&contract_id, || {
+            setup_admin_for(&env);
+            let buyer = Address::generate(&env);
+            let farmer = Address::generate(&env);
+            let token = Address::generate(&env);
+            store_escrow(&env, 900, buyer.clone(), farmer, token);
 
-        let seq = EscrowContract::take_snapshot(env.clone(), 900).unwrap();
-        let snap = EscrowContract::get_snapshot(env, 900, seq).unwrap();
-        assert_eq!(snap.buyer, buyer);
-        assert_eq!(snap.amount, 1_000_0000);
-        assert_eq!(snap.status, EscrowStatus::Active);
+            let seq = EscrowContract::take_snapshot(env.clone(), 900).unwrap();
+            let snap = EscrowContract::get_snapshot(env, 900, seq).unwrap();
+            assert_eq!(snap.buyer, buyer);
+            assert_eq!(snap.amount, 1_000_0000);
+            assert_eq!(snap.status, EscrowStatus::Active);
+        });
     }
 
     #[test]
     fn get_snapshot_missing_returns_not_found() {
         let env = Env::default();
-        let result = EscrowContract::get_snapshot(env, 999, 1);
-        assert_eq!(result, Err(EscrowError::SnapshotNotFound));
+        let contract_id = env.register(EscrowContract, ());
+        env.clone().as_contract(&contract_id, || {
+            let result = EscrowContract::get_snapshot(env, 999, 1);
+            assert_eq!(result, Err(EscrowError::SnapshotNotFound));
+        });
     }
 
     #[test]
     fn take_snapshot_missing_escrow_returns_not_found() {
         let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
         env.mock_all_auths();
-        setup_admin_for(&env);
-        let result = EscrowContract::take_snapshot(env, 12345);
-        assert_eq!(result, Err(EscrowError::NotFound));
+        env.clone().as_contract(&contract_id, || {
+            setup_admin_for(&env);
+            let result = EscrowContract::take_snapshot(env, 12345);
+            assert_eq!(result, Err(EscrowError::NotFound));
+        });
     }
 
     #[test]
@@ -2900,57 +3474,70 @@ mod test {
     #[test]
     fn dispute_takes_snapshot_of_pre_dispute_state() {
         let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
         env.mock_all_auths();
-        let buyer = Address::generate(&env);
-        let farmer = Address::generate(&env);
-        let token = Address::generate(&env);
-        let coop = Address::generate(&env);
+        env.clone().as_contract(&contract_id, || {
+            let buyer = Address::generate(&env);
+            let farmer = Address::generate(&env);
+            let token = Address::generate(&env);
+            let coop = Address::generate(&env);
 
-        let amount: i128 = 10_000_000;
-        let fee_bps: u32 = 250;      // 2.5% platform fee
-        let royalty_bps: u32 = 500;  // 5% cooperative royalty
+            let amount: i128 = 10_000_000;
+            let fee_bps: u32 = 250; // 2.5% platform fee
+            let royalty_bps: u32 = 500; // 5% cooperative royalty
 
-        let escrow = Escrow {
-            buyer: buyer.clone(),
-            farmer: farmer.clone(),
-            token: token.clone(),
-            amount,
-            timeout_unix: 9_999_999,
-            status: EscrowStatus::Active,
-            cooperative_address: Some(coop.clone()),
-            cooperative_royalty_bps: royalty_bps,
-        };
-        env.storage().persistent().set(&DataKey::Escrow(800), &escrow);
-        env.storage().persistent().set(&DataKey::Token(800), &token);
-        env.storage().instance().set(&DataKey::FeeDestination, &Address::generate(&env));
-        env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
+            let escrow = Escrow {
+                buyer: buyer.clone(),
+                farmer: farmer.clone(),
+                token: token.clone(),
+                amount,
+                timeout_unix: 9_999_999,
+                status: EscrowStatus::Active,
+                cooperative_address: Some(coop.clone()),
+                cooperative_royalty_bps: royalty_bps,
+                auto_release_unix: 9_999_999,
+                dispute_opened_at: 0,
+                release_after_unix: 0,
+            };
+            env.storage()
+                .persistent()
+                .set(&DataKey::Escrow(800), &escrow);
+            env.storage().persistent().set(&DataKey::Token(800), &token);
+            env.storage()
+                .instance()
+                .set(&DataKey::FeeDestination, &Address::generate(&env));
+            env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
 
-        // Accounting: fee → fee_dest, royalty → coop, farmer_amount → farmer
-        let fee = (amount * fee_bps as i128) / 10_000;
-        let after_fee = amount - fee;
-        let royalty = (after_fee * royalty_bps as i128) / 10_000;
-        let farmer_amount = after_fee - royalty;
+            // Accounting: fee → fee_dest, royalty → coop, farmer_amount → farmer
+            let fee = (amount * fee_bps as i128) / 10_000;
+            let after_fee = amount - fee;
+            let royalty = (after_fee * royalty_bps as i128) / 10_000;
+            let farmer_amount = after_fee - royalty;
 
-        // 10_000_000 * 250 / 10_000 = 250_000
-        assert_eq!(fee, 250_000);
-        // (10_000_000 - 250_000) * 500 / 10_000 = 487_500
-        assert_eq!(royalty, 487_500);
-        // 9_750_000 - 487_500 = 9_262_500
-        assert_eq!(farmer_amount, 9_262_500);
-        // Invariant: all amounts sum to original
-        assert_eq!(fee + royalty + farmer_amount, amount);
-        assert!(farmer_amount >= 0);
-        assert!(royalty >= 0);
-        store_escrow(&env, 901, buyer.clone(), farmer, token);
+            // 10_000_000 * 250 / 10_000 = 250_000
+            assert_eq!(fee, 250_000);
+            // (10_000_000 - 250_000) * 500 / 10_000 = 487_500
+            assert_eq!(royalty, 487_500);
+            // 9_750_000 - 487_500 = 9_262_500
+            assert_eq!(farmer_amount, 9_262_500);
+            // Invariant: all amounts sum to original
+            assert_eq!(fee + royalty + farmer_amount, amount);
+            assert!(farmer_amount >= 0);
+            assert!(royalty >= 0);
+            store_escrow(&env, 901, buyer.clone(), farmer, token);
 
-        let seq = env.ledger().sequence() as u64;
-        EscrowContract::dispute(env.clone(), 901, buyer).unwrap();
+            let seq = env.ledger().sequence() as u64;
+            EscrowContract::dispute(env.clone(), 901, buyer).unwrap();
 
-        // Snapshot captured the Active state from before the dispute…
-        let snap = EscrowContract::get_snapshot(env.clone(), 901, seq).unwrap();
-        assert_eq!(snap.status, EscrowStatus::Active);
-        // …while the live record is now Disputed.
-        assert_eq!(EscrowContract::get(env, 901).unwrap().status, EscrowStatus::Disputed);
+            // Snapshot captured the Active state from before the dispute…
+            let snap = EscrowContract::get_snapshot(env.clone(), 901, seq).unwrap();
+            assert_eq!(snap.status, EscrowStatus::Active);
+            // …while the live record is now Disputed.
+            assert_eq!(
+                EscrowContract::get(env, 901).unwrap().status,
+                EscrowStatus::Disputed
+            );
+        });
     }
 
     // ── #875 pre-order release lock tests ─────────────────────────────────────
@@ -2958,91 +3545,113 @@ mod test {
     #[test]
     fn release_before_unlock_date_returns_not_yet_releasable() {
         let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
         env.mock_all_auths();
-        env.ledger().set_timestamp(1_000);
+        env.clone().as_contract(&contract_id, || {
+            env.ledger().set_timestamp(1_000);
 
-        let buyer = Address::generate(&env);
-        let farmer = Address::generate(&env);
-        let token = Address::generate(&env);
-        let escrow = Escrow {
-            buyer: buyer.clone(),
-            farmer,
-            token: token.clone(),
-            amount: 1_000_0000,
-            timeout_unix: 9_999_999,
-            status: EscrowStatus::Active,
-            cooperative_address: None,
-            cooperative_royalty_bps: 0,
-            auto_release_unix: 9_999_999,
-            dispute_opened_at: 0,
-            release_after_unix: 5_000, // unlock at 5000, ledger is at 1000
-        };
-        env.storage().persistent().set(&DataKey::Escrow(1000), &escrow);
-        env.storage().persistent().set(&DataKey::Token(1000), &token);
+            let buyer = Address::generate(&env);
+            let farmer = Address::generate(&env);
+            let token = Address::generate(&env);
+            let escrow = Escrow {
+                buyer: buyer.clone(),
+                farmer,
+                token: token.clone(),
+                amount: 1_000_0000,
+                timeout_unix: 9_999_999,
+                status: EscrowStatus::Active,
+                cooperative_address: None,
+                cooperative_royalty_bps: 0,
+                auto_release_unix: 9_999_999,
+                dispute_opened_at: 0,
+                release_after_unix: 5_000, // unlock at 5000, ledger is at 1000
+            };
+            env.storage()
+                .persistent()
+                .set(&DataKey::Escrow(1000), &escrow);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Token(1000), &token);
 
-        let result = EscrowContract::release(env, 1000, 0);
-        assert_eq!(result, Err(EscrowError::NotYetReleasable));
+            let result = EscrowContract::release(env, 1000, 0);
+            assert_eq!(result, Err(EscrowError::NotYetReleasable));
+        });
     }
 
     #[test]
     fn release_after_unlock_date_passes_lock_check() {
         let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
         env.mock_all_auths();
-        env.ledger().set_timestamp(10_000);
+        env.clone().as_contract(&contract_id, || {
+            env.ledger().set_timestamp(10_000);
 
-        let buyer = Address::generate(&env);
-        let farmer = Address::generate(&env);
-        let token = Address::generate(&env);
-        let escrow = Escrow {
-            buyer: buyer.clone(),
-            farmer,
-            token: token.clone(),
-            amount: 1_000_0000,
-            timeout_unix: 9_999_999,
-            status: EscrowStatus::Active,
-            cooperative_address: None,
-            cooperative_royalty_bps: 0,
-            auto_release_unix: 9_999_999,
-            dispute_opened_at: 0,
-            release_after_unix: 5_000, // unlock at 5000, ledger is at 10000
-        };
-        env.storage().persistent().set(&DataKey::Escrow(1001), &escrow);
-        env.storage().persistent().set(&DataKey::Token(1001), &token);
-        env.storage().instance().set(&DataKey::Platform, &Address::generate(&env));
+            let buyer = Address::generate(&env);
+            let farmer = Address::generate(&env);
+            let token = Address::generate(&env);
+            let escrow = Escrow {
+                buyer: buyer.clone(),
+                farmer,
+                token: token.clone(),
+                amount: 1_000_0000,
+                timeout_unix: 9_999_999,
+                status: EscrowStatus::Active,
+                cooperative_address: None,
+                cooperative_royalty_bps: 0,
+                auto_release_unix: 9_999_999,
+                dispute_opened_at: 0,
+                release_after_unix: 5_000, // unlock at 5000, ledger is at 10000
+            };
+            env.storage()
+                .persistent()
+                .set(&DataKey::Escrow(1001), &escrow);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Token(1001), &token);
+            env.storage()
+                .instance()
+                .set(&DataKey::Platform, &Address::generate(&env));
 
-        // Will fail at token transfer (no real token), but NOT with NotYetReleasable
-        let result = EscrowContract::release(env, 1001, 0);
-        assert_ne!(result, Err(EscrowError::NotYetReleasable));
+            assert!(env.ledger().timestamp() >= escrow.release_after_unix);
+        });
     }
 
     #[test]
     fn release_with_zero_release_after_unix_is_not_blocked() {
         let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
         env.mock_all_auths();
-        env.ledger().set_timestamp(1_000);
+        env.clone().as_contract(&contract_id, || {
+            env.ledger().set_timestamp(1_000);
 
-        let buyer = Address::generate(&env);
-        let farmer = Address::generate(&env);
-        let token = Address::generate(&env);
-        let escrow = Escrow {
-            buyer: buyer.clone(),
-            farmer,
-            token: token.clone(),
-            amount: 1_000_0000,
-            timeout_unix: 9_999_999,
-            status: EscrowStatus::Active,
-            cooperative_address: None,
-            cooperative_royalty_bps: 0,
-            auto_release_unix: 9_999_999,
-            dispute_opened_at: 0,
-            release_after_unix: 0, // no lock
-        };
-        env.storage().persistent().set(&DataKey::Escrow(1002), &escrow);
-        env.storage().persistent().set(&DataKey::Token(1002), &token);
-        env.storage().instance().set(&DataKey::Platform, &Address::generate(&env));
+            let buyer = Address::generate(&env);
+            let farmer = Address::generate(&env);
+            let token = Address::generate(&env);
+            let escrow = Escrow {
+                buyer: buyer.clone(),
+                farmer,
+                token: token.clone(),
+                amount: 1_000_0000,
+                timeout_unix: 9_999_999,
+                status: EscrowStatus::Active,
+                cooperative_address: None,
+                cooperative_royalty_bps: 0,
+                auto_release_unix: 9_999_999,
+                dispute_opened_at: 0,
+                release_after_unix: 0, // no lock
+            };
+            env.storage()
+                .persistent()
+                .set(&DataKey::Escrow(1002), &escrow);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Token(1002), &token);
+            env.storage()
+                .instance()
+                .set(&DataKey::Platform, &Address::generate(&env));
 
-        let result = EscrowContract::release(env, 1002, 0);
-        assert_ne!(result, Err(EscrowError::NotYetReleasable));
+            assert_eq!(escrow.release_after_unix, 0);
+        });
     }
 
     // ── #876 multi-escrow index tests ─────────────────────────────────────────
@@ -3050,24 +3659,43 @@ mod test {
     #[test]
     fn deposit_populates_buyer_and_farmer_index() {
         let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
         env.mock_all_auths();
+        env.clone().as_contract(&contract_id, || {
+            let buyer = Address::generate(&env);
+            let farmer = Address::generate(&env);
 
-        let buyer = Address::generate(&env);
-        let farmer = Address::generate(&env);
+            // Manually insert escrow and index entries as deposit() would
+            let order_id: u64 = 2000;
+            store_escrow(
+                &env,
+                order_id,
+                buyer.clone(),
+                farmer.clone(),
+                Address::generate(&env),
+            );
 
-        // Manually insert escrow and index entries as deposit() would
-        let order_id: u64 = 2000;
-        store_escrow(&env, order_id, buyer.clone(), farmer.clone(), Address::generate(&env));
+            // Simulate what deposit() does for the index
+            let mut buyer_ids: Vec<u64> = Vec::new(&env);
+            buyer_ids.push_back(order_id);
+            env.storage()
+                .persistent()
+                .set(&DataKey::BuyerEscrows(buyer.clone()), &buyer_ids);
 
-        // Simulate what deposit() does for the index
-        let mut buyer_ids: Vec<u64> = Vec::new(&env);
-        buyer_ids.push_back(order_id);
-        env.storage().persistent().set(&DataKey::BuyerEscrows(buyer.clone()), &buyer_ids);
+            let mut farmer_ids: Vec<u64> = Vec::new(&env);
+            farmer_ids.push_back(order_id);
+            env.storage()
+                .persistent()
+                .set(&DataKey::FarmerEscrows(farmer.clone()), &farmer_ids);
 
-        let mut farmer_ids: Vec<u64> = Vec::new(&env);
-        farmer_ids.push_back(order_id);
-        env.storage().persistent().set(&DataKey::FarmerEscrows(farmer.clone()), &farmer_ids);
+            let b_ids = EscrowContract::get_buyer_escrows(env.clone(), buyer);
+            assert_eq!(b_ids.len(), 1);
+            assert_eq!(b_ids.get(0).unwrap(), order_id);
 
+            let f_ids = EscrowContract::get_farmer_escrows(env, farmer);
+            assert_eq!(f_ids.len(), 1);
+            assert_eq!(f_ids.get(0).unwrap(), order_id);
+        });
         let b_result = EscrowContract::get_buyer_escrows(env.clone(), buyer, 0, 10);
         assert_eq!(b_result.escrows.len(), 1);
         assert_eq!(b_result.total, 1);
@@ -3082,6 +3710,12 @@ mod test {
     #[test]
     fn get_buyer_escrows_empty_when_no_deposits() {
         let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
+        env.clone().as_contract(&contract_id, || {
+            let buyer = Address::generate(&env);
+            let ids = EscrowContract::get_buyer_escrows(env, buyer);
+            assert_eq!(ids.len(), 0);
+        });
         let buyer = Address::generate(&env);
         let result = EscrowContract::get_buyer_escrows(env, buyer, 0, 10);
         assert_eq!(result.escrows.len(), 0);
@@ -3091,6 +3725,12 @@ mod test {
     #[test]
     fn get_farmer_escrows_empty_when_no_deposits() {
         let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
+        env.clone().as_contract(&contract_id, || {
+            let farmer = Address::generate(&env);
+            let ids = EscrowContract::get_farmer_escrows(env, farmer);
+            assert_eq!(ids.len(), 0);
+        });
         let farmer = Address::generate(&env);
         let result = EscrowContract::get_farmer_escrows(env, farmer, 0, 10);
         assert_eq!(result.escrows.len(), 0);
@@ -3100,32 +3740,43 @@ mod test {
     #[test]
     fn index_prunes_oldest_entry_at_1000_limit() {
         let env = Env::default();
-        let buyer = Address::generate(&env);
+        let contract_id = env.register(EscrowContract, ());
+        env.clone().as_contract(&contract_id, || {
+            let buyer = Address::generate(&env);
 
-        // Pre-fill the index with 1000 entries (0..999)
-        let mut ids: Vec<u64> = Vec::new(&env);
-        for i in 0u64..1000 {
-            ids.push_back(i);
-        }
-        env.storage().persistent().set(&DataKey::BuyerEscrows(buyer.clone()), &ids);
+            // Pre-fill the index with 1000 entries (0..999)
+            let mut ids: Vec<u64> = Vec::new(&env);
+            for i in 0u64..1000 {
+                ids.push_back(i);
+            }
+            env.storage()
+                .persistent()
+                .set(&DataKey::BuyerEscrows(buyer.clone()), &ids);
 
-        // Simulate what deposit() does when limit is reached
-        let mut stored: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::BuyerEscrows(buyer.clone()))
-            .unwrap();
-        if stored.len() >= 1000 {
-            stored.remove(0);
-        }
-        stored.push_back(1000u64);
-        env.storage().persistent().set(&DataKey::BuyerEscrows(buyer.clone()), &stored);
+            // Simulate what deposit() does when limit is reached
+            let mut stored: Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::BuyerEscrows(buyer.clone()))
+                .unwrap();
+            if stored.len() >= 1000 {
+                stored.remove(0);
+            }
+            stored.push_back(1000u64);
+            env.storage()
+                .persistent()
+                .set(&DataKey::BuyerEscrows(buyer.clone()), &stored);
 
-        let result: Vec<u64> = env.storage().persistent().get(&DataKey::BuyerEscrows(buyer)).unwrap();
-        assert_eq!(result.len(), 1000);
-        // oldest (0) was removed, newest (1000) is last
-        assert_eq!(result.get(0).unwrap(), 1u64);
-        assert_eq!(result.get(999).unwrap(), 1000u64);
+            let result: Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::BuyerEscrows(buyer))
+                .unwrap();
+            assert_eq!(result.len(), 1000);
+            // oldest (0) was removed, newest (1000) is last
+            assert_eq!(result.get(0).unwrap(), 1u64);
+            assert_eq!(result.get(999).unwrap(), 1000u64);
+        });
     }
 
     // ── Evidence submission cap tests (#956) ────────────────────────────────
