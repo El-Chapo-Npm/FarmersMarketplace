@@ -14,18 +14,56 @@
  *   db.query(sql, params) → Promise<{ rows, rowCount }>
  *   db.exec(sql)           → Promise<void>  (DDL / multi-statement)
  *   db.isPostgres         → boolean
+ *
+ * Boolean normalization: SQLite stores booleans as 0/1 integers, PostgreSQL as true/false.
+ * This layer normalizes both to consistent boolean values for the active column.
  */
 
 const path = require('path');
 
 const USE_POSTGRES = !!process.env.DATABASE_URL;
 
+/**
+ * Normalize boolean values in a row for consistency across SQLite and PostgreSQL.
+ * Converts 0/1 integers and string representations to proper booleans.
+ */
+function normalizeBooleans(row) {
+  if (!row || typeof row !== 'object') return row;
+
+  const normalized = { ...row };
+  const booleanColumns = ['active', 'fee_bumped', 'is_preorder', 'low_stock_alerted', 'acknowledged', 'success'];
+
+  for (const col of booleanColumns) {
+    if (col in normalized) {
+      const val = normalized[col];
+      if (val === null || val === undefined) {
+        normalized[col] = null;
+      } else if (typeof val === 'boolean') {
+        normalized[col] = val;
+      } else if (typeof val === 'number') {
+        normalized[col] = val !== 0;
+      } else if (typeof val === 'string') {
+        normalized[col] = val === 'true' || val === '1';
+      }
+    }
+  }
+
+  return normalized;
+}
+
 if (USE_POSTGRES) {
   const pg = require('./postgres');
   const { runMigrations } = require('./migrationRunner');
 
   const db = {
-    query: (text, params) => pg.query(text, params),
+    query: async (text, params) => {
+      const result = await pg.query(text, params);
+      // Normalize boolean values in rows for consistency
+      if (result.rows && Array.isArray(result.rows)) {
+        result.rows = result.rows.map((row) => normalizeBooleans(row));
+      }
+      return result;
+    },
     async exec(sql) {
       await pg.pool.query(sql);
     },
@@ -46,7 +84,9 @@ if (USE_POSTGRES) {
 
   let sqlite;
   try {
-    sqlite = new Database(path.join(__dirname, '../../market.db'));
+    sqlite = new Database(path.join(__dirname, '../../market.db'), {
+      timeout: parseInt(process.env.DB_QUERY_TIMEOUT_SQLITE || '5000', 10),
+    });
   } catch (err) {
     console.error('[DB] Failed to open SQLite database:', err.message);
     process.exit(1);
@@ -61,11 +101,11 @@ if (USE_POSTGRES) {
       });
       if (/^\s*(SELECT|WITH)/i.test(text)) {
         const rows = sqlite.prepare(text).all(...params);
-        return { rows, rowCount: rows.length };
+        return { rows: rows.map(normalizeBooleans), rowCount: rows.length };
       }
       if (/\bRETURNING\b/i.test(text)) {
         const row = sqlite.prepare(text).get(...params);
-        return { rows: row ? [row] : [], rowCount: row ? 1 : 0 };
+        return { rows: row ? [normalizeBooleans(row)] : [], rowCount: row ? 1 : 0 };
       }
       const info = sqlite.prepare(text).run(...params);
       return { rows: [], rowCount: info.changes };
@@ -108,6 +148,7 @@ if (USE_POSTGRES) {
       stellar_public_key TEXT,
       stellar_secret_key TEXT,
       active INTEGER DEFAULT 1,
+      deactivated_at DATETIME,
       verification_status TEXT DEFAULT 'unverified',
       verification_docs TEXT,
       bio TEXT,
@@ -158,8 +199,9 @@ try { db.exec(`ALTER TABLE products ADD COLUMN low_stock_threshold INTEGER DEFAU
 try { db.exec(`ALTER TABLE products ADD COLUMN low_stock_alerted INTEGER DEFAULT 0`); } catch {}
 try { db.exec(`ALTER TABLE products ADD COLUMN harvest_date DATE`); } catch {}
 try { db.exec(`ALTER TABLE products ADD COLUMN best_before DATE`); } catch {}
-try { db.exec(`ALTER TABLE users ADD COLUMN active INTEGER DEFAULT 1`); } catch {}
-// Allow admin role — SQLite doesn't support ALTER COLUMN, so we handle it in auth logic
+ try { db.exec(`ALTER TABLE users ADD COLUMN active INTEGER DEFAULT 1`); } catch {}
+ try { db.exec(`ALTER TABLE users ADD COLUMN deactivated_at DATETIME`); } catch {}
+ // Allow admin role — SQLite doesn't support ALTER COLUMN, so we handle it in auth logic
 try { db.exec(`ALTER TABLE users ADD COLUMN bio TEXT`); } catch {}
 try { db.exec(`ALTER TABLE users ADD COLUMN location TEXT`); } catch {}
 try { db.exec(`ALTER TABLE users ADD COLUMN avatar_url TEXT`); } catch {}
@@ -196,10 +238,12 @@ try { db.exec(`ALTER TABLE products ADD COLUMN low_stock_alerted INTEGER DEFAULT
       escrow_status TEXT DEFAULT 'none',
       address_id INTEGER,
       fee_bumped INTEGER DEFAULT 0,
+      bundle_id INTEGER,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (buyer_id) REFERENCES users(id),
       FOREIGN KEY (product_id) REFERENCES products(id),
-      FOREIGN KEY (address_id) REFERENCES addresses(id)
+      FOREIGN KEY (address_id) REFERENCES addresses(id),
+      FOREIGN KEY (bundle_id) REFERENCES bundles(id) ON DELETE SET NULL
     );
 
     CREATE TABLE IF NOT EXISTS refresh_tokens (
@@ -439,6 +483,7 @@ try { db.exec(`ALTER TABLE products ADD COLUMN low_stock_alerted INTEGER DEFAULT
       name TEXT NOT NULL,
       type TEXT NOT NULL CHECK(type IN ('escrow','token','other')),
       network TEXT NOT NULL CHECK(network IN ('testnet','mainnet')),
+      wasm_hash TEXT,
       deployed_by INTEGER REFERENCES users(id),
       deployed_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
@@ -450,6 +495,111 @@ try { db.exec(`ALTER TABLE products ADD COLUMN low_stock_alerted INTEGER DEFAULT
 const Database = require('better-sqlite3');
 const path = require('path');
 
+const db = new Database(path.join(__dirname, '../../market.db'));
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    email TEXT UNIQUE NOT NULL,
+    password TEXT NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('farmer', 'buyer', 'admin')),
+    stellar_public_key TEXT,
+    stellar_secret_key TEXT,
+    farm_lat REAL,
+    farm_lng REAL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS products (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    farmer_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    description TEXT,
+    price REAL NOT NULL,
+    quantity INTEGER NOT NULL,
+    unit TEXT DEFAULT 'unit',
+    weight_kg REAL DEFAULT 1.0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    restock_notified_at DATETIME,
+    FOREIGN KEY (farmer_id) REFERENCES users(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    buyer_id INTEGER NOT NULL,
+    product_id INTEGER NOT NULL,
+    quantity INTEGER NOT NULL,
+    total_price REAL NOT NULL,
+    shipping_cost REAL DEFAULT 0,
+    status TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'paid', 'failed')),
+    stellar_tx_hash TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (buyer_id) REFERENCES users(id),
+    FOREIGN KEY (product_id) REFERENCES products(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS returns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL UNIQUE,
+    buyer_id INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    status TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'approved', 'rejected')),
+    refund_tx_hash TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (order_id) REFERENCES orders(id),
+    FOREIGN KEY (buyer_id) REFERENCES users(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS product_scheduling (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_id INTEGER NOT NULL UNIQUE,
+    available_from DATETIME NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (product_id) REFERENCES products(id)
+  );
+`);
+
+// Migrate existing DB: add new columns (errors mean the column already exists — safe to ignore)
+const columnMigrations = [
+  'ALTER TABLE products ADD COLUMN weight_kg REAL DEFAULT 1.0',
+  'ALTER TABLE orders ADD COLUMN shipping_cost REAL DEFAULT 0',
+  'ALTER TABLE users ADD COLUMN farm_lat REAL',
+  'ALTER TABLE users ADD COLUMN farm_lng REAL',
+  'ALTER TABLE orders ADD COLUMN delivered_at DATETIME',
+  'ALTER TABLE returns ADD COLUMN reject_reason TEXT',
+];
+
+for (const sql of columnMigrations) {
+  try { db.exec(sql); } catch { /* column already present */ }
+}
+
+// Migrate users role CHECK constraint to include 'admin' if needed
+const usersRow = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'").get();
+if (usersRow && !usersRow.sql.includes("'admin'")) {
+  db.pragma('foreign_keys = OFF');
+  db.exec(`
+    CREATE TABLE users_new (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      email TEXT UNIQUE NOT NULL,
+      password TEXT NOT NULL,
+      role TEXT NOT NULL CHECK(role IN ('farmer', 'buyer', 'admin')),
+      stellar_public_key TEXT,
+      stellar_secret_key TEXT,
+      farm_lat REAL,
+      farm_lng REAL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+    INSERT INTO users_new (id, name, email, password, role, stellar_public_key, stellar_secret_key, created_at)
+      SELECT id, name, email, password, role, stellar_public_key, stellar_secret_key, created_at FROM users;
+    DROP TABLE users;
+    ALTER TABLE users_new RENAME TO users;
+  `);
+  db.pragma('foreign_keys = ON');
+}
+
+module.exports = db;
 const USE_POSTGRES = !!process.env.DATABASE_URL;
 
 let db;
@@ -499,41 +649,40 @@ if (USE_POSTGRES) {
     transaction(fn) {
       return sqlite.transaction(fn);
     },
-    // For synchronous access if needed (better-sqlite3 specialized)
     prepare(sql) {
       return sqlite.prepare(sql);
     },
-    exec(sql) {
-      return sqlite.exec(sql);
-    },
-    isPostgres: false,
   };
+
+  const { runMigrations } = require('./migrationRunner');
+  runMigrations(db).catch((err) => {
+    console.error('[DB] Migration failed:', err.message);
+    process.exit(1);
+  });
+
+// Migrate users role CHECK constraint to include 'admin' if needed
+const usersRow = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'").get();
+if (usersRow && !usersRow.sql.includes("'admin'")) {
+  db.pragma('foreign_keys = OFF');
+  db.exec(`
+    CREATE TABLE users_new (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      email TEXT UNIQUE NOT NULL,
+      password TEXT NOT NULL,
+      role TEXT NOT NULL CHECK(role IN ('farmer', 'buyer', 'admin')),
+      stellar_public_key TEXT,
+      stellar_secret_key TEXT,
+      farm_lat REAL,
+      farm_lng REAL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+    INSERT INTO users_new (id, name, email, password, role, stellar_public_key, stellar_secret_key, created_at)
+      SELECT id, name, email, password, role, stellar_public_key, stellar_secret_key, created_at FROM users;
+    DROP TABLE users;
+    ALTER TABLE users_new RENAME TO users;
+  `);
+  db.pragma('foreign_keys = ON');
 }
 
-  // Simple migration runner for SQLite columns
-  const migrations = [
-    `ALTER TABLE products ADD COLUMN pricing_model TEXT DEFAULT 'fixed'`,
-    `ALTER TABLE products ADD COLUMN min_price REAL`,
-    `ALTER TABLE orders ADD COLUMN custom_price REAL`,
-    `ALTER TABLE orders ADD COLUMN fee_bumped INTEGER DEFAULT 0`,
-    `ALTER TABLE products ADD COLUMN grade TEXT DEFAULT 'Ungraded' CHECK(grade IN ('A','B','C','Ungraded'))`,
-  ];
-  for (const sql of migrations) {
-    try { sqlite.exec(sql); } catch (e) {}
-  }
-
-  // Adapter for common query interface
-  sqlite.query = async (text, params = []) => {
-    let i = 0;
-    const sqliteText = text.replace(/\$\d+/g, () => { i++; return '?'; });
-    if (/^\s*(SELECT|WITH)/i.test(sqliteText)) {
-      const rows = sqlite.prepare(sqliteText).all(...params);
-      return { rows, rowCount: rows.length };
-    }
-    const info = sqlite.prepare(sqliteText).run(...params);
-    return { rows: [], rowCount: info.changes };
-  };
-  sqlite.isPostgres = false;
-
-  module.exports = sqlite;
-}
+module.exports = db;
