@@ -37,6 +37,11 @@
 
 #![no_std]
 
+use soroban_sdk::{contract, contractimpl, contracttype, contracterror, symbol_short, token, Address, Env, Vec};
+
+/// Maximum number of entries accepted by `batch_credit` in a single call —
+/// keeps the transaction under Stellar's operation limit.
+const MAX_BATCH_CREDIT: u32 = 20;
 use soroban_sdk::{contract, contractimpl, contracttype, contracterror, token, Address, Env, BytesN};
 
 // ---------------------------------------------------------------------------
@@ -55,6 +60,10 @@ pub enum EarningsError {
     ZeroBalance = 3,
     /// Platform address has not been initialised.
     NotInitialised = 4,
+    /// `batch_credit` was called with more than `MAX_BATCH_CREDIT` entries.
+    BatchTooLarge = 5,
+    /// Contract is paused; credit() and claim() are disabled.
+    Paused = 6,
     /// Contract has already been initialized.
     AlreadyInitialized = 5,
     /// Invalid WASM hash (all zeros).
@@ -72,6 +81,10 @@ pub enum DataKey {
     Balance(Address),
     /// Platform fee recipient address.
     Platform,
+    /// Admin pause flag: if true, credit() and claim() return Paused error.
+    PausedState,
+    /// Lifetime total earnings for a creator (farmer_amount only, never reset).
+    LifetimeEarned(Address),
     /// Authorized address that can call credit() (e.g., escrow contract).
     AuthorizedCaller,
     /// Flag indicating the contract has been initialized.
@@ -113,6 +126,20 @@ impl CreatorEarningsContract {
         Ok(())
     }
 
+    /// Admin-only: set or clear the pause flag.
+    /// When paused, credit() and claim() return Paused error.
+    /// balance() continues to work.
+    pub fn set_paused(env: Env, paused: bool) -> Result<(), EarningsError> {
+        let platform: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Platform)
+            .ok_or(EarningsError::NotInitialised)?;
+        platform.require_auth();
+        env.storage().instance().set(&DataKey::PausedState, &paused);
+        Ok(())
+    }
+
     /// Credit `amount` tokens to `creator`, splitting off `fee_bps` basis
     /// points to the platform. Restricted to the authorized caller (typically escrow).
     /// The caller must have already transferred `amount` tokens to this contract
@@ -126,6 +153,14 @@ impl CreatorEarningsContract {
         amount: i128,
         fee_bps: u32,
     ) -> Result<(i128, i128), EarningsError> {
+        let paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::PausedState)
+            .unwrap_or(false);
+        if paused {
+            return Err(EarningsError::Paused);
+        }
         let authorized_caller: Address = env
             .storage()
             .instance()
@@ -144,6 +179,14 @@ impl CreatorEarningsContract {
         let farmer_amount: i128 = amount - fee_amount;
 
         // Accumulate the creator's claimable balance.
+        let balance_key = DataKey::Balance(creator.clone());
+        let prev: i128 = env.storage().persistent().get(&balance_key).unwrap_or(0);
+        env.storage().persistent().set(&balance_key, &(prev + farmer_amount));
+
+        // Accumulate lifetime earnings (independent of claimable balance, never reset).
+        let lifetime_key = DataKey::LifetimeEarned(creator.clone());
+        let lifetime_prev: i128 = env.storage().persistent().get(&lifetime_key).unwrap_or(0);
+        env.storage().persistent().set(&lifetime_key, &(lifetime_prev + farmer_amount));
         let creator_key = DataKey::Balance(creator.clone());
         let creator_prev: i128 = env.storage().persistent().get(&creator_key).unwrap_or(0);
         env.storage().persistent().set(&creator_key, &(creator_prev + farmer_amount));
@@ -167,6 +210,40 @@ impl CreatorEarningsContract {
         Ok((farmer_amount, fee_amount))
     }
 
+    /// Batch credit multiple (creator, amount, fee_bps) tuples in a single call.
+    /// - At most `MAX_BATCH_CREDIT` (20) entries are accepted; otherwise
+    ///   `EarningsError::BatchTooLarge`.
+    /// - Each credit is independent: a failing one emits
+    ///   ("earnings", "batch_credit_error", creator) and the batch continues.
+    /// - Returns one `(creator, succeeded)` pair per input entry, in order.
+    pub fn batch_credit(
+        env: Env,
+        entries: Vec<(Address, i128, u32)>,
+    ) -> Result<Vec<(Address, bool)>, EarningsError> {
+        if entries.len() > MAX_BATCH_CREDIT as usize {
+            return Err(EarningsError::BatchTooLarge);
+        }
+
+        let mut results: Vec<(Address, bool)> = Vec::new(&env);
+        for (creator, amount, fee_bps) in entries.iter() {
+            match Self::credit(env.clone(), creator.clone(), amount, fee_bps) {
+                Ok(_) => results.push_back((creator.clone(), true)),
+                Err(_) => {
+                    env.events().publish(
+                        (
+                            symbol_short!("earnings"),
+                            soroban_sdk::Symbol::new(&env, "batch_credit_error"),
+                            creator.clone(),
+                        ),
+                        (),
+                    );
+                    results.push_back((creator.clone(), false));
+                }
+            }
+        }
+        Ok(results)
+    }
+
     /// Transfer the caller's entire accumulated balance to themselves via
     /// `token`.  Resets their on-chain balance to zero.
     /// Emits a `claim` event on success.
@@ -175,6 +252,15 @@ impl CreatorEarningsContract {
         creator: Address,
         token: Address,
     ) -> Result<i128, EarningsError> {
+        let paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::PausedState)
+            .unwrap_or(false);
+        if paused {
+            return Err(EarningsError::Paused);
+        }
+
         creator.require_auth();
 
         let key = DataKey::Balance(creator.clone());
@@ -209,6 +295,14 @@ impl CreatorEarningsContract {
             .unwrap_or(0)
     }
 
+    /// Read-only: return the lifetime total earnings (farmer_amount only) for
+    /// `creator`. This counter is incremented on every credit() and never reset
+    /// by claim() — it reflects total earnings across all time.
+    pub fn lifetime_earned(env: Env, creator: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::LifetimeEarned(creator))
+            .unwrap_or(0)
     /// Read-only: return the platform's accumulated fee balance. (#960)
     pub fn platform_balance(env: Env) -> i128 {
         let platform: Address = match env.storage().instance().get(&DataKey::Platform) {
@@ -524,6 +618,8 @@ mod test {
         assert_eq!(CreatorEarningsContract::balance(env.clone(), bob), 2_000);
     }
 
+    #[test]
+    fn batch_credit_too_large() {
     // ── fuzz tests ───────────────────────────────────────────────────────────
 
     /// Fuzz credit with adversarial combinations of amount and fee_bps.
@@ -576,6 +672,47 @@ mod test {
         env.mock_all_auths();
         CreatorEarningsContract::init(env.clone(), Address::generate(&env));
 
+        let mut entries: Vec<(Address, i128, u32)> = Vec::new(&env);
+        for _ in 0..21 {
+            entries.push_back((Address::generate(&env), 1_000, 0));
+        }
+
+        let result = CreatorEarningsContract::batch_credit(env, entries);
+        assert_eq!(result, Err(EarningsError::BatchTooLarge));
+    }
+
+    #[test]
+    fn batch_credit_partial_failure_continues() {
+        let env = Env::default();
+        env.mock_all_auths();
+        CreatorEarningsContract::init(env.clone(), Address::generate(&env));
+
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+        let charlie = Address::generate(&env);
+
+        let mut entries: Vec<(Address, i128, u32)> = Vec::new(&env);
+        entries.push_back((alice.clone(), 1_000, 0));
+        entries.push_back((bob.clone(), 0, 0)); // Invalid: amount = 0
+        entries.push_back((charlie.clone(), 2_000, 250));
+
+        let results = CreatorEarningsContract::batch_credit(env.clone(), entries).unwrap();
+
+        // Should have 3 results, with bob's failing (false).
+        assert_eq!(results.len(), 3);
+        assert_eq!(results.get(0), (alice.clone(), true));
+        assert_eq!(results.get(1), (bob.clone(), false));
+        assert_eq!(results.get(2), (charlie.clone(), true));
+
+        // Verify balances — only alice and charlie should have credits.
+        assert_eq!(CreatorEarningsContract::balance(env.clone(), alice), 1_000);
+        assert_eq!(CreatorEarningsContract::balance(env.clone(), bob), 0); // Not credited due to error
+        // charlie: 2_000 - (2_000 * 250 / 10_000) = 2_000 - 50 = 1_950
+        assert_eq!(CreatorEarningsContract::balance(env.clone(), charlie), 1_950);
+    }
+
+    #[test]
+    fn batch_credit_empty_is_ok() {
         for &amount in amounts {
             for &fee_bps in fee_bps_vals {
                 let creator = Address::generate(&env);
@@ -698,6 +835,115 @@ mod test {
         env.mock_all_auths();
         CreatorEarningsContract::init(env.clone(), Address::generate(&env));
 
+        let entries: Vec<(Address, i128, u32)> = Vec::new(&env);
+        let results = CreatorEarningsContract::batch_credit(env, entries).unwrap();
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn set_paused_and_credit_rejected_when_paused() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let platform = Address::generate(&env);
+        CreatorEarningsContract::init(env.clone(), platform.clone());
+
+        let creator = Address::generate(&env);
+
+        // Initially unpaused: credit should succeed.
+        let result = CreatorEarningsContract::credit(env.clone(), creator.clone(), 1_000, 0);
+        assert!(result.is_ok());
+        assert_eq!(CreatorEarningsContract::balance(env.clone(), creator.clone()), 1_000);
+
+        // Pause the contract.
+        let pause_result = CreatorEarningsContract::set_paused(env.clone(), true);
+        assert!(pause_result.is_ok());
+
+        // credit() should now return Paused error.
+        let result = CreatorEarningsContract::credit(env.clone(), creator.clone(), 500, 0);
+        assert_eq!(result, Err(EarningsError::Paused));
+
+        // balance() should still work while paused.
+        assert_eq!(CreatorEarningsContract::balance(env.clone(), creator.clone()), 1_000);
+    }
+
+    #[test]
+    fn set_paused_and_claim_rejected_when_paused() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let platform = Address::generate(&env);
+        CreatorEarningsContract::init(env.clone(), platform.clone());
+
+        let creator = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        // Seed a balance.
+        env.storage()
+            .persistent()
+            .set(&DataKey::Balance(creator.clone()), &500_i128);
+
+        // Pause the contract.
+        CreatorEarningsContract::set_paused(env.clone(), true).unwrap();
+
+        // claim() should return Paused error.
+        let result = CreatorEarningsContract::claim(env.clone(), creator.clone(), token);
+        assert_eq!(result, Err(EarningsError::Paused));
+
+        // balance() should still work while paused.
+        assert_eq!(CreatorEarningsContract::balance(env.clone(), creator), 500);
+    }
+
+    #[test]
+    fn unpause_allows_credit_and_claim() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let platform = Address::generate(&env);
+        CreatorEarningsContract::init(env.clone(), platform.clone());
+
+        let creator = Address::generate(&env);
+
+        // Pause.
+        CreatorEarningsContract::set_paused(env.clone(), true).unwrap();
+
+        // Verify credit is rejected.
+        let result = CreatorEarningsContract::credit(env.clone(), creator.clone(), 1_000, 0);
+        assert_eq!(result, Err(EarningsError::Paused));
+
+        // Unpause.
+        CreatorEarningsContract::set_paused(env.clone(), false).unwrap();
+
+        // credit() should now succeed.
+        let result = CreatorEarningsContract::credit(env.clone(), creator.clone(), 1_000, 0);
+        assert!(result.is_ok());
+        assert_eq!(CreatorEarningsContract::balance(env.clone(), creator), 1_000);
+    }
+
+    #[test]
+    fn lifetime_earned_tracks_total_credits() {
+        let env = Env::default();
+        env.mock_all_auths();
+        CreatorEarningsContract::init(env.clone(), Address::generate(&env));
+
+        let creator = Address::generate(&env);
+
+        // Initially zero.
+        assert_eq!(CreatorEarningsContract::lifetime_earned(env.clone(), creator.clone()), 0);
+
+        // Credit 1_000 with 0 fee → farmer gets 1_000, lifetime becomes 1_000.
+        CreatorEarningsContract::credit(env.clone(), creator.clone(), 1_000, 0).unwrap();
+        assert_eq!(CreatorEarningsContract::lifetime_earned(env.clone(), creator.clone()), 1_000);
+
+        // Credit 500 with 250 bps fee → farmer gets 487.5 (truncated to 487 due to integer division).
+        // 500 * 250 / 10_000 = 12.5 (truncated to 12), so farmer gets 500 - 12 = 488.
+        CreatorEarningsContract::credit(env.clone(), creator.clone(), 500, 250).unwrap();
+        // lifetime_earned should be 1_000 + 488 = 1_488.
+        assert_eq!(CreatorEarningsContract::lifetime_earned(env.clone(), creator.clone()), 1_488);
+    }
+
+    #[test]
+    fn lifetime_earned_survives_claim() {
+        let env = Env::default();
+        env.mock_all_auths();
+        CreatorEarningsContract::init(env.clone(), Address::generate(&env));
         for &initial_bal in initial_balances {
             let creator = Address::generate(&env);
             let token = Address::generate(&env);
@@ -885,6 +1131,37 @@ mod test {
         let creator = Address::generate(&env);
         let token = Address::generate(&env);
 
+        // Credit 1_000.
+        CreatorEarningsContract::credit(env.clone(), creator.clone(), 1_000, 0).unwrap();
+        assert_eq!(CreatorEarningsContract::lifetime_earned(env.clone(), creator.clone()), 1_000);
+        assert_eq!(CreatorEarningsContract::balance(env.clone(), creator.clone()), 1_000);
+
+        // Manually reset balance to 0 (simulates a successful claim).
+        env.storage()
+            .persistent()
+            .set(&DataKey::Balance(creator.clone()), &0_i128);
+
+        // balance() is now zero, but lifetime_earned should be unchanged.
+        assert_eq!(CreatorEarningsContract::balance(env.clone(), creator.clone()), 0);
+        assert_eq!(CreatorEarningsContract::lifetime_earned(env.clone(), creator.clone()), 1_000);
+    }
+
+    #[test]
+    fn lifetime_earned_accumulates_across_multiple_credits() {
+        let env = Env::default();
+        env.mock_all_auths();
+        CreatorEarningsContract::init(env.clone(), Address::generate(&env));
+
+        let creator = Address::generate(&env);
+
+        // Multiple credits with various fees.
+        CreatorEarningsContract::credit(env.clone(), creator.clone(), 1_000, 0).unwrap();
+        CreatorEarningsContract::credit(env.clone(), creator.clone(), 1_000, 0).unwrap();
+        CreatorEarningsContract::credit(env.clone(), creator.clone(), 1_000, 500).unwrap(); // 50% fee
+
+        // Last credit: 1_000 * 500 / 10_000 = 50 fee, farmer gets 950.
+        // Total: 1_000 + 1_000 + 950 = 2_950.
+        assert_eq!(CreatorEarningsContract::lifetime_earned(env.clone(), creator), 2_950);
         // Seed a balance directly.
         env.storage()
             .persistent()

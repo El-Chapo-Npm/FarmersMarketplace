@@ -1,5 +1,8 @@
 #![no_std]
 
+mod stream;
+mod validate_id;
+
 use soroban_sdk::{contract, contractimpl, contracttype, contracterror, symbol_short, token, Address, Bytes, BytesN, Env, Vec};
 
 mod validate_id;
