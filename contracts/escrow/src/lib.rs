@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Address, Env};
 
 #[derive(Clone)]
 #[contracttype]
@@ -77,6 +77,8 @@ impl EscrowContract {
 
         escrow.released = true;
         env.storage().persistent().set(&DataKey::Escrow(order_id), &escrow);
+        env.events()
+            .publish((symbol_short!("release"), order_id), escrow.amount);
     }
 
     pub fn refund(env: Env, xlm_token: Address, order_id: u64) {
