@@ -384,14 +384,6 @@ registerRoute('/', '', require('./export'));
 registerRoute('/', '/announcements', require('./announcements'));
 registerRoute('/', '/auctions', require('./auctions'));
 
-router.use('/api/coupons',    require('./coupons'));
-router.use('/api/export',     require('./export'));
-router.use('/api/categories', require('./categories'));
-router.use('/api/reviews',    require('./reviews'));
-
-router.use('/api/coupons',    require('./coupons'));
-router.use('/api/export',     require('./export'));
-router.use('/api/categories', require('./categories'));
-router.use('/api/reviews',    require('./reviews'));
+registerRoute('/', '/categories', require('./categories'));
 
 module.exports = router;
