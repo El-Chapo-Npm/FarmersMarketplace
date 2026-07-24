@@ -210,9 +210,37 @@ DATABASE_URL=postgresql://user:pass@host:5432/dbname \
   node backend/scripts/migrate-sqlite-to-pg.js
 ```
 
-## Contract Testing (Soroban)
+## Soroban Contract Layout
 
-Test Soroban contracts against a local Stellar node using the built-in test harness.
+The repository currently maintains two Soroban contract layouts. They are
+related, but they are not the same deployment surface.
+
+| Path | Role | Notes |
+|---|---|---|
+| `contract/` | Legacy escrow crate | Used by backend contract integration tests, `contract/test-futurenet.sh`, `contract/cli.sh`, and the legacy WASM profile. |
+| `contract/reward-token/` | Legacy reward token crate | Paired with the legacy integration surface and built separately from `contract/`. |
+| `contracts/escrow/` | Workspace escrow crate | Current Rust workspace escrow implementation for newer contract hardening work. |
+| `contracts/creator-earnings/` | Workspace creator earnings crate | Tracks creator balances and fee splits in the `contracts/` workspace. |
+
+Shared contract conventions and the decision to maintain both layouts for now
+are recorded in [ADR 0001](docs/adr/0001-soroban-contract-boundaries.md).
+
+### Workspace contract tests
+
+Run the current workspace contract tests from `contracts/`:
+
+```bash
+cd contracts
+cargo test -p soroban-escrow --lib
+cargo test -p creator-earnings --features testutils
+cargo build -p soroban-escrow --target wasm32-unknown-unknown --release
+cargo build -p creator-earnings --target wasm32-unknown-unknown --release
+```
+
+### Legacy contract integration testing
+
+Test the legacy `contract/` escrow against a local Stellar node using the
+backend test harness.
 
 ### Start the local node
 
@@ -260,7 +288,8 @@ A dedicated **nightly CI job** (`contract-tests-nightly` in `.github/workflows/c
 
 ## Futurenet E2E Integration Test (#861)
 
-The script `contract/test-futurenet.sh` runs a full end-to-end test of the escrow contract on **Stellar Futurenet** using real XLM transfers.
+The script `contract/test-futurenet.sh` runs a full end-to-end test of the
+legacy `contract/` escrow on **Stellar Futurenet** using real XLM transfers.
 
 ### What it tests
 
@@ -315,9 +344,12 @@ DEPOSIT_XLM=2 FEE_BPS=500 SKIP_BUILD=1 ./contract/test-futurenet.sh
 
 ---
 
-## Soroban Escrow Contract (`contract/`)
+## Legacy Soroban Escrow Contract (`contract/`)
 
-The `contract/` directory contains a Soroban smart contract that provides on-chain escrow for marketplace orders.
+The `contract/` directory contains the legacy Soroban escrow contract that
+provides on-chain escrow for marketplace orders. Do not treat it as
+interchangeable with the workspace escrow at `contracts/escrow/`; see
+[ADR 0001](docs/adr/0001-soroban-contract-boundaries.md) for the boundary.
 
 ### Functions
 
@@ -395,4 +427,3 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md) for full guidance on:
 - Issue workflow and label guide
 
 For security vulnerabilities, follow the process in [SECURITY.md](./SECURITY.md) instead of opening a public issue.
-
