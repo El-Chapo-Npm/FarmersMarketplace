@@ -10,11 +10,6 @@ use soroban_sdk::{
 mod stream;
 mod validate_id;
 
-use soroban_sdk::{contract, contractimpl, contracttype, contracterror, symbol_short, token, Address, Bytes, BytesN, Env, Vec};
-
-mod validate_id;
-mod stream;
-
 // TTL thresholds for persistent escrow entries (~57–115 days at 5 s/ledger).
 const TTL_MIN: u32 = 100_000;
 const TTL_MAX: u32 = 200_000;
@@ -85,7 +80,6 @@ pub enum EscrowError {
     SubmissionWindowClosed = 20,
     /// Auto-release time has not yet been reached. (#878)
     AutoReleaseNotReached = 21,
-    AutoReleaseNotReached  = 21,
     /// Cooperative signer configuration exceeds maximum allowed. (#979)
     TooManyCoopSigners     = 22,
     /// Release called before the pre-order unlock date. (#875)
@@ -1542,10 +1536,13 @@ impl EscrowContract {
         let total = all_escrows.len() as u32;
         let capped_limit = core::cmp::min(limit, MAX_ESCROW_PAGE_SIZE);
         let start = offset as usize;
-        let end = core::cmp::min((offset as usize) + (capped_limit as usize), all_escrows.len());
+        let end = core::cmp::min(
+            (offset as usize) + (capped_limit as usize),
+            all_escrows.len() as usize,
+        );
 
         let mut page = Vec::new(&env);
-        if start < all_escrows.len() {
+        if start < all_escrows.len() as usize {
             for i in start..end {
                 page.push_back(all_escrows.get(i as u32).unwrap());
             }
@@ -1569,10 +1566,13 @@ impl EscrowContract {
         let total = all_escrows.len() as u32;
         let capped_limit = core::cmp::min(limit, MAX_ESCROW_PAGE_SIZE);
         let start = offset as usize;
-        let end = core::cmp::min((offset as usize) + (capped_limit as usize), all_escrows.len());
+        let end = core::cmp::min(
+            (offset as usize) + (capped_limit as usize),
+            all_escrows.len() as usize,
+        );
 
         let mut page = Vec::new(&env);
-        if start < all_escrows.len() {
+        if start < all_escrows.len() as usize {
             for i in start..end {
                 page.push_back(all_escrows.get(i as u32).unwrap());
             }
