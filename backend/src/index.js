@@ -9,6 +9,7 @@ const { startProductViewsAggJob } = require('./jobs/aggregateProductViews');
 const { startFreshnessJob } = require('./jobs/processFreshnessAlerts');
 const { startContractMonitor } = require('./jobs/contractMonitor');
 const { startContractRegistrySync } = require('./jobs/contractRegistrySync');
+const { startCreatorEarningsMonitor } = require('./jobs/creatorEarningsMonitor');
 const { startPushSubscriptionCleanup } = require('./jobs/cleanupPushSubscriptions');
 const { startExpiryJob } = require('./jobs/deactivateExpiredProducts');
 const { startAnonymizeJob } = require('./jobs/anonymizeDeactivatedUsers');
@@ -22,6 +23,7 @@ app.listen(PORT, () => {
   startFreshnessJob();
   startContractMonitor();
   startContractRegistrySync();
+  startCreatorEarningsMonitor();
   startPushSubscriptionCleanup();
   startAnonymizeJob();
   startExpiryJob();
