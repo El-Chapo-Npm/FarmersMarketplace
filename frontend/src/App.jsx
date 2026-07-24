@@ -1,5 +1,6 @@
 import React, { lazy, Suspense, useEffect, useContext } from 'react';
 import { Routes, Route, Navigate, useLocation } from 'react-router-dom';
+import { HelmetProvider } from 'react-helmet-async';
 import { AuthProvider, useAuth } from './context/AuthContext';
 import { FavoritesProvider } from './context/FavoritesContext';
 import { CompareProvider } from './context/CompareContext';
@@ -7,8 +8,10 @@ import { LoadingProvider, LoadingContext } from './context/LoadingContext';
 import { setLoadingCallback, setLogoutCallback } from './api/client';
 import ErrorBoundary from './components/ErrorBoundary';
 import Navbar from './components/Navbar';
+import AnnouncementBanner from './components/AnnouncementBanner';
 import LoadingSpinner from './components/LoadingSpinner';
 import PageLoader from './components/PageLoader';
+import { initSentry } from './utils/sentry';
 
 const LoginPage = lazy(() => import('./pages/Auth').then(m => ({ default: m.LoginPage })));
 const RegisterPage = lazy(() => import('./pages/Auth').then(m => ({ default: m.RegisterPage })));
@@ -42,14 +45,14 @@ function Home() {
 }
 
 function AppContent() {
-  const { setLoading } = useContext(LoadingContext);
+  const { startLoading, stopLoading } = useContext(LoadingContext);
   const { logout } = useAuth();
   const location = useLocation();
 
   useEffect(() => {
-    setLoadingCallback(setLoading);
+    setLoadingCallback((isStart) => isStart ? startLoading() : stopLoading());
     setLogoutCallback(logout);
-  }, [setLoading, logout]);
+  }, [startLoading, stopLoading, logout]);
 
   // Announce page changes to screen readers
   useEffect(() => {
@@ -59,6 +62,7 @@ function AppContent() {
 
   return (
     <>
+      <AnnouncementBanner />
       <Navbar />
       <LoadingSpinner />
       <main id="main-content" style={{ paddingTop: 24 }}>
@@ -87,17 +91,23 @@ function AppContent() {
 }
 
 export default function App() {
+  React.useEffect(() => {
+    initSentry();
+  }, []);
+
   return (
-    <ErrorBoundary>
-      <AuthProvider>
-        <FavoritesProvider>
-          <CompareProvider>
-            <LoadingProvider>
-              <AppContent />
-            </LoadingProvider>
-          </CompareProvider>
-        </FavoritesProvider>
-      </AuthProvider>
-    </ErrorBoundary>
+    <HelmetProvider>
+      <ErrorBoundary>
+        <AuthProvider>
+          <FavoritesProvider>
+            <CompareProvider>
+              <LoadingProvider>
+                <AppContent />
+              </LoadingProvider>
+            </CompareProvider>
+          </FavoritesProvider>
+        </AuthProvider>
+      </ErrorBoundary>
+    </HelmetProvider>
   );
 }
