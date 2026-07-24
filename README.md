@@ -210,6 +210,12 @@ DATABASE_URL=postgresql://user:pass@host:5432/dbname \
   node backend/scripts/migrate-sqlite-to-pg.js
 ```
 
+## Rate Limiting
+
+Per-user and per-IP rate limits (`backend/src/middleware/rateLimitPerUser.js`) use Redis when `REDIS_URL` is set, and fall back to an in-memory Map otherwise.
+
+The in-memory fallback is fine for local dev and single-process deployments, but it is **not suitable for long-running, high-cardinality production traffic** — set `REDIS_URL` for those deployments so limiter state is bounded and shared across processes.
+
 ## Soroban Contract Layout
 
 The repository currently maintains two Soroban contract layouts. They are
