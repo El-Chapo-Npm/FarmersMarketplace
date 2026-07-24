@@ -117,6 +117,7 @@ jest.mock('../src/routes', () => {
   router.use('/api/analytics', require('../src/routes/analytics'));
   router.use('/api/notifications', require('../src/routes/notifications'));
   router.use('/api/creator-earnings', require('../src/routes/creatorEarnings'));
+  router.use('/api/admin', require('../src/routes/admin'));
   return router;
 });
 
