@@ -13,9 +13,10 @@ const {
   claimBalance,
   mintRewardTokens,
   invokeEscrowContract,
-  pathPayment,
-  getPathPaymentEstimate,
+  recordCarbonOffset,
+  getCarbonOffset,
 } = require('../utils/stellar');
+const { estimateCarbonFootprint } = require('../utils/carbon');
 const {
   sendOrderEmails,
   sendLowStockAlert,
@@ -651,8 +652,12 @@ router.patch('/:id/status', auth, validate.updateOrderStatus, async (req, res) =
   if (req.user.role !== 'farmer') return err(res, 403, 'Farmers only', 'forbidden');
   const { status } = req.body;
   const { rows } = await db.query(
-    `SELECT o.*, p.name as product_name, p.unit, u.name as buyer_name, u.email as buyer_email
-     FROM orders o JOIN products p ON o.product_id = p.id JOIN users u ON o.buyer_id = u.id
+    `SELECT o.*, p.name as product_name, p.unit, p.category, p.carbon_kg_per_unit,
+            u.name as buyer_name, u.email as buyer_email, f.stellar_public_key as farmer_wallet
+     FROM orders o
+     JOIN products p ON o.product_id = p.id
+     JOIN users u ON o.buyer_id = u.id
+     JOIN users f ON p.farmer_id = f.id
      WHERE o.id = $1 AND p.farmer_id = $2`,
     [req.params.id, req.user.id]
   );
@@ -672,8 +677,19 @@ router.patch('/:id/status', auth, validate.updateOrderStatus, async (req, res) =
     title: 'Order status updated',
     body: `Order #${order.id} is now ${status}`,
     url: '/orders',
-  }).catch((pushErr) => console.error('Push notification failed:', pushErr.message));
   }).catch((pushErr) => logger.error('Push notification failed:', { error: pushErr.message }));
+
+  if (status === 'delivered') {
+    const estimate = estimateCarbonFootprint(
+      { category: order.category, carbon_kg_per_unit: order.carbon_kg_per_unit },
+      order.quantity
+    );
+    recordCarbonOffset({
+      orderId: order.id,
+      kgCo2: estimate.carbonKg,
+      verifierPublicKey: order.farmer_wallet,
+    }).catch((e) => logger.error('Carbon offset recording failed:', { error: e.message, orderId: order.id }));
+  }
 
   res.json({ success: true, message: 'Order status updated' });
 });
@@ -729,6 +745,38 @@ router.post('/:id/refund', auth, async (req, res) => {
     return res.status(402).json({ success: false, message: 'Refund failed: ' + e.message, code: 'refund_failed' });
   }
   res.json({ success: true, data, total, page, limit });
+});
+
+// GET /api/orders/:id/carbon — on-chain carbon offset record + shareable certificate URL
+router.get('/:id/carbon', auth, async (req, res) => {
+  const { rows } = await db.query(
+    `SELECT o.id, o.buyer_id, p.farmer_id
+     FROM orders o JOIN products p ON o.product_id = p.id
+     WHERE o.id = $1`,
+    [req.params.id]
+  );
+  const order = rows[0];
+  if (!order) return err(res, 404, 'Order not found', 'not_found');
+  if (order.buyer_id !== req.user.id && order.farmer_id !== req.user.id && req.user.role !== 'admin') {
+    return err(res, 403, 'Forbidden', 'forbidden');
+  }
+
+  try {
+    const offset = await getCarbonOffset(order.id);
+    if (!offset || offset.success === false) {
+      return err(res, 404, 'No carbon offset record found for this order', 'not_found');
+    }
+    const base = process.env.FRONTEND_URL || process.env.FRONTEND_ORIGIN || '';
+    res.json({
+      success: true,
+      data: {
+        ...offset,
+        certificateUrl: `${base}/orders/${order.id}/carbon-certificate`,
+      },
+    });
+  } catch (e) {
+    err(res, 502, `Failed to fetch carbon offset record: ${e.message}`, 'rpc_error');
+  }
 });
 
 module.exports = router;

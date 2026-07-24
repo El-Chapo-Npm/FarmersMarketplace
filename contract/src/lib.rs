@@ -15,6 +15,12 @@ use soroban_sdk::{
 
 const ESCROW_KEY: &str = "escrow";
 
+// TTL bump applied to instance storage on every write so the escrow record doesn't
+// get archived between create() and submit_work()/approve()/cancel()/expire() (in
+// ledgers, ~5s each): ~6 days threshold, ~30 days bump.
+const BUMP_THRESHOLD: u32 = 100_000;
+const BUMP_AMOUNT: u32 = 500_000;
+
 #[contract]
 pub struct EscrowContract;
 
@@ -39,23 +45,28 @@ impl EscrowContract {
 
         payer.require_auth();
 
+        let data = EscrowData {
+            payer: payer.clone(),
+            freelancer,
+            token: token.clone(),
+            amount,
+            status: EscrowStatus::Active,
+            deadline,
+        };
+
+        // Effects before interactions: the escrow record is written before the token
+        // transfer below so a reentrant create() call (triggered by a malicious
+        // token/callback during the transfer) sees `has(&symbol_short!("escrow")) ==
+        // true` and is rejected, instead of racing past the check above.
+        env.storage().instance().set(&symbol_short!("escrow"), &data);
+        env.storage().instance().extend_ttl(BUMP_THRESHOLD, BUMP_AMOUNT);
+
         // Transfer funds from payer into the contract
         TokenClient::new(&env, &token).transfer(
             &payer,
             &env.current_contract_address(),
             &amount,
         );
-
-        let data = EscrowData {
-            payer,
-            freelancer,
-            token,
-            amount,
-            status: EscrowStatus::Active,
-            deadline,
-        };
-
-        env.storage().instance().set(&symbol_short!("escrow"), &data);
 
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("created")),
@@ -77,6 +88,7 @@ impl EscrowContract {
 
         data.status = EscrowStatus::WorkSubmitted;
         env.storage().instance().set(&symbol_short!("escrow"), &data);
+        env.storage().instance().extend_ttl(BUMP_THRESHOLD, BUMP_AMOUNT);
 
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("submitted")),
@@ -97,14 +109,16 @@ impl EscrowContract {
             return Err(EscrowError::WorkNotSubmitted);
         }
 
+        // Effects before interactions — see create() above.
+        data.status = EscrowStatus::Approved;
+        env.storage().instance().set(&symbol_short!("escrow"), &data);
+        env.storage().instance().extend_ttl(BUMP_THRESHOLD, BUMP_AMOUNT);
+
         TokenClient::new(&env, &data.token).transfer(
             &env.current_contract_address(),
             &data.freelancer,
             &data.amount,
         );
-
-        data.status = EscrowStatus::Approved;
-        env.storage().instance().set(&symbol_short!("escrow"), &data);
 
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("approved")),
@@ -125,14 +139,16 @@ impl EscrowContract {
             return Err(EscrowError::NotActive);
         }
 
+        // Effects before interactions — see create() above.
+        data.status = EscrowStatus::Cancelled;
+        env.storage().instance().set(&symbol_short!("escrow"), &data);
+        env.storage().instance().extend_ttl(BUMP_THRESHOLD, BUMP_AMOUNT);
+
         TokenClient::new(&env, &data.token).transfer(
             &env.current_contract_address(),
             &data.payer,
             &data.amount,
         );
-
-        data.status = EscrowStatus::Cancelled;
-        env.storage().instance().set(&symbol_short!("escrow"), &data);
 
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("cancelled")),
@@ -159,14 +175,16 @@ impl EscrowContract {
             return Err(EscrowError::DeadlineNotReached);
         }
 
+        // Effects before interactions — see create() above.
+        data.status = EscrowStatus::Expired;
+        env.storage().instance().set(&symbol_short!("escrow"), &data);
+        env.storage().instance().extend_ttl(BUMP_THRESHOLD, BUMP_AMOUNT);
+
         TokenClient::new(&env, &data.token).transfer(
             &env.current_contract_address(),
             &data.payer,
             &data.amount,
         );
-
-        data.status = EscrowStatus::Expired;
-        env.storage().instance().set(&symbol_short!("escrow"), &data);
 
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("expired")),
