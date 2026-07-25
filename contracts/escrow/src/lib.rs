@@ -1,5 +1,9 @@
 #![no_std]
 
+mod errors;
+
+use errors::EscrowError;
+use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env};
 #[cfg(test)]
 extern crate std;
 
@@ -100,6 +104,17 @@ pub enum EscrowStatus {
     Refunded,
     Disputed,
 }
+
+// Backend order IDs are auto-incrementing DB primary keys; in practice they never
+// approach this bound. Rejecting anything larger guards against malformed/overflowed
+// caller input reaching contract storage.
+const MAX_ORDER_ID: u64 = 1_000_000_000_000;
+
+// TTL bump applied to escrow storage entries on every write so records don't get
+// archived between deposit and release/refund/dispute (in ledgers, ~5s each):
+// ~6 days threshold, ~30 days bump.
+const BUMP_THRESHOLD: u32 = 100_000;
+const BUMP_AMOUNT: u32 = 500_000;
 
 #[derive(Clone)]
 #[contracttype]
@@ -324,6 +339,15 @@ impl EscrowContract {
         if amount <= 0 {
             return Err(EscrowError::InvalidAmount);
         }
+        if order_id >= MAX_ORDER_ID {
+            return Err(EscrowError::InvalidAmount);
+        }
+
+        let key = DataKey::Escrow(order_id);
+        if env.storage().persistent().has(&key) {
+            panic!("escrow already exists");
+        }
+        }
 
         // Royalty bps must not exceed 10 000 (100%)
         if cooperative_royalty_bps > 10_000 {
@@ -361,6 +385,7 @@ impl EscrowContract {
             .unwrap_or(Self::DEFAULT_AUTO_RELEASE_DAYS);
         let escrow = Escrow {
             buyer: buyer.clone(),
+            farmer,
             farmer: farmer.clone(),
             // Clone token before moving it into the struct so we can persist it separately.
             token: token.clone(),
@@ -373,6 +398,27 @@ impl EscrowContract {
             dispute_opened_at: 0,
             release_after_unix,
         };
+
+        // Effects before interactions: the escrow record is written before the token
+        // transfer below so a reentrant deposit() for the same order_id (triggered by
+        // a malicious token/callback during the transfer) sees `has(&key) == true` and
+        // is rejected, instead of racing past the check above.
+        env.storage().persistent().set(&key, &escrow);
+        env.storage().persistent().extend_ttl(&key, BUMP_THRESHOLD, BUMP_AMOUNT);
+
+        let token_client = token::Client::new(&env, &xlm_token);
+        token_client.transfer(&buyer, &env.current_contract_address(), &amount);
+
+        Ok(())
+    }
+
+    pub fn release(env: Env, xlm_token: Address, order_id: u64) {
+        let key = DataKey::Escrow(order_id);
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("escrow not found");
         // Persist the token used for this escrow so releases/refunds must use the same token contract.
         env.storage()
             .persistent()
@@ -559,6 +605,24 @@ impl EscrowContract {
             EscrowStatus::Active => {}
         }
 
+        // Effects before interactions: mark released before transferring funds so a
+        // reentrant release()/refund() call during the transfer sees the updated
+        // state and is blocked by the checks above.
+        escrow.released = true;
+        env.storage().persistent().set(&key, &escrow);
+        env.storage().persistent().extend_ttl(&key, BUMP_THRESHOLD, BUMP_AMOUNT);
+
+        let token_client = token::Client::new(&env, &xlm_token);
+        token_client.transfer(&env.current_contract_address(), &escrow.farmer, &escrow.amount);
+    }
+
+    pub fn refund(env: Env, xlm_token: Address, order_id: u64) {
+        let key = DataKey::Escrow(order_id);
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("escrow not found");
         // #875: block release until the pre-order unlock date
         if escrow.release_after_unix > 0 && env.ledger().timestamp() < escrow.release_after_unix {
             return Err(EscrowError::NotYetReleasable);
@@ -763,6 +827,23 @@ impl EscrowContract {
             return Err(EscrowError::InvalidToken);
         }
 
+        // Effects before interactions — see release() above.
+        escrow.refunded = true;
+        env.storage().persistent().set(&key, &escrow);
+        env.storage().persistent().extend_ttl(&key, BUMP_THRESHOLD, BUMP_AMOUNT);
+
+        let token_client = token::Client::new(&env, &xlm_token);
+        token_client.transfer(&env.current_contract_address(), &escrow.buyer, &escrow.amount);
+    }
+
+    pub fn dispute(env: Env, order_id: u64, caller: Address) {
+        caller.require_auth();
+        let key = DataKey::Escrow(order_id);
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("escrow not found");
         let token_client = token::Client::new(&env, &escrow.token);
 
         // Use stored fee_bps if initialized, otherwise use the passed parameter.
@@ -1004,6 +1085,10 @@ impl EscrowContract {
             return Err(EscrowError::InvalidToken);
         }
 
+        escrow.disputed = true;
+        env.storage().persistent().set(&key, &escrow);
+        env.storage().persistent().extend_ttl(&key, BUMP_THRESHOLD, BUMP_AMOUNT);
+    }
         let token_client = token::Client::new(env, &escrow.token);
         let effective_bps: u32 = env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0);
         let fee_amount = (escrow.amount * effective_bps as i128) / 10_000;
@@ -3933,5 +4018,26 @@ mod test {
         let empty_page = EscrowContract::get_buyer_escrows(env, buyer, 300, 50);
         assert_eq!(empty_page.total, 250);
         assert_eq!(empty_page.escrows.len(), 0);
+    }
+
+    #[test]
+    fn deposit_rejects_order_id_over_max() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let buyer = Address::generate(&env);
+        let farmer = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        let err = EscrowContract::deposit(
+            env,
+            token,
+            MAX_ORDER_ID,
+            buyer,
+            farmer,
+            100,
+            1_000,
+        )
+        .unwrap_err();
+        assert_eq!(err, EscrowError::InvalidAmount);
     }
 }
