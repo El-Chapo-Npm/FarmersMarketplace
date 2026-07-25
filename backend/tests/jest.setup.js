@@ -54,6 +54,7 @@ jest.mock('../src/utils/stellar', () => ({
   getContractState:       jest.fn(),
   getContractWasmHash:    jest.fn().mockResolvedValue('0'.repeat(64)),
   simulateContractCall:   jest.fn(),
+  invokeContract:         jest.fn(),
   sendPayment: jest.fn().mockResolvedValue('TXHASH123'),
   createWallet: jest.fn(() => ({ publicKey: 'GPUBKEY', secretKey: 'SSECRET' })),
   getBalance: jest.fn().mockResolvedValue(1000),
@@ -115,6 +116,8 @@ jest.mock('../src/routes', () => {
   router.use('/api/orders/:id/return', require('../src/routes/returns'));
   router.use('/api/analytics', require('../src/routes/analytics'));
   router.use('/api/notifications', require('../src/routes/notifications'));
+  router.use('/api/creator-earnings', require('../src/routes/creatorEarnings'));
+  router.use('/api/admin', require('../src/routes/admin'));
   return router;
 });
 
@@ -186,6 +189,7 @@ beforeEach(() => {
   });
   stellar.claimBalance?.mockResolvedValue('CLAIM_TX_001');
   stellar.simulateContractCall = jest.fn();
+  stellar.invokeContract = jest.fn();
   stellar.getContractWasmHash = jest.fn().mockResolvedValue('0'.repeat(64));
 
   const mailer = jest.requireMock('../src/utils/mailer');
