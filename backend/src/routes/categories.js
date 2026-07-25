@@ -1,3 +1,58 @@
+/**
+ * @swagger
+ * tags:
+ *   name: Categories
+ *   description: Product category management
+ *
+ * /api/v1/categories:
+ *   get:
+ *     summary: List all categories with product counts
+ *     tags: [Categories]
+ *     responses:
+ *       200:
+ *         description: Array of categories
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success: { type: boolean, example: true }
+ *                 data:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                     properties:
+ *                       id: { type: integer }
+ *                       name: { type: string }
+ *                       slug: { type: string }
+ *                       product_count: { type: integer }
+ *
+ * /api/v1/admin/categories:
+ *   post:
+ *     summary: Create a category (admin only)
+ *     tags: [Categories]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [name]
+ *             properties:
+ *               name: { type: string }
+ *               slug: { type: string }
+ *     responses:
+ *       201:
+ *         description: Category created
+ *       400:
+ *         $ref: '#/components/responses/BadRequest'
+ *       403:
+ *         $ref: '#/components/responses/Forbidden'
+ *       409:
+ *         description: Slug already taken
+ */
 const router = require('express').Router();
 const db = require('../db/schema');
 const auth = require('../middleware/auth');
@@ -83,11 +138,6 @@ router.delete('/admin/categories/:id', auth, (req, res) => {
 
   db.prepare('DELETE FROM categories WHERE id = ?').run(req.params.id);
   res.json({ success: true, message: 'Category deleted' });
-const db = require('../db/postgres');
-
-router.get('/', async (req, res) => {
-  const result = await db.query('SELECT * FROM categories ORDER BY name');
-  res.json(result.rows);
 });
 
 module.exports = router;

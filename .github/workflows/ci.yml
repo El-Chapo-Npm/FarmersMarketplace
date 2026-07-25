@@ -70,6 +70,22 @@ jobs:
 
       - name: Run lint
         run: npm run lint
+
+  smoke-test-testnet:
+    name: Escrow Testnet Smoke Test
+    # Only on merges to main — this touches live Stellar Testnet, not on every PR.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: contracts/escrow
+    env:
+      ORDER_ID: ${{ github.run_id }}
+      STELLAR_SECRET_KEY: ${{ secrets.STELLAR_SECRET_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
         env:
           ESLINT_USE_FLAT_CONFIG: 'false'
 
@@ -163,6 +179,20 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
 
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            contracts/escrow/target
+          key: ${{ runner.os }}-escrow-smoke-${{ hashFiles('contracts/escrow/Cargo.lock') }}
+
+      - name: Install Stellar CLI
+        run: command -v stellar >/dev/null || cargo install --locked stellar-cli
+
+      - name: Run smoke test (deposit -> release -> verify Horizon event)
+        run: ./cli.sh smoke-test
       - name: Cache Cargo registry
         uses: actions/cache@v4
         with:

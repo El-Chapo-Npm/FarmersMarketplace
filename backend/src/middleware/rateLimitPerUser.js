@@ -10,7 +10,11 @@
  *
  * IN-MEMORY FALLBACK (local dev / no Redis):
  *   A module-level Map stores timestamps per key. Old timestamps are pruned
- *   on every check. Accurate for single-process deployments and tests.
+ *   on every check, and a periodic sweep evicts keys that go idle (no
+ *   longer accessed at all) so memory doesn't grow unbounded over the
+ *   life of the process. Accurate for single-process deployments and
+ *   tests, but not suitable for long-running, high-cardinality traffic —
+ *   configure REDIS_URL in that case.
  *
  * RESPONSE ON VIOLATION:
  *   HTTP 429 with { code: 'rate_limit_exceeded' }
@@ -21,6 +25,29 @@ const { err } = require('./error');
 
 // In-memory sliding-window store: key -> number[] (sorted timestamps)
 const memoryStore = new Map();
+
+// Periodic sweep to evict keys that have gone idle. Access-time pruning
+// (in memorySlide) only cleans a key's array when that same key is
+// checked again, so a one-off visitor/bot would otherwise sit in the Map
+// forever. STALE_KEY_MS is comfortably larger than any rate-limit window
+// in use so a sweep never evicts a key mid-window.
+const SWEEP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+const STALE_KEY_MS = 2 * 60 * 60 * 1000; // 2 hours
+
+function sweepMemoryStore() {
+  const cutoff = Date.now() - STALE_KEY_MS;
+  for (const [key, timestamps] of memoryStore) {
+    const fresh = timestamps.filter((t) => t > cutoff);
+    if (fresh.length === 0) {
+      memoryStore.delete(key);
+    } else if (fresh.length !== timestamps.length) {
+      memoryStore.set(key, fresh);
+    }
+  }
+}
+
+let sweepTimer = setInterval(sweepMemoryStore, SWEEP_INTERVAL_MS);
+if (sweepTimer.unref) sweepTimer.unref();
 
 let redisClient = null;
 let redisInitialized = false;

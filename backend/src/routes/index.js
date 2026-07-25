@@ -363,6 +363,7 @@ registerRoute('/', '/notifications', require('./notifications'));
 registerRoute('/', '/contracts', require('./contracts'));
 registerRoute('/', '/escrow', require('./escrow'));
 registerRoute('/', '/creator-earnings', require('./creatorEarnings'));
+registerRoute('/', '/paymentStreams', require('./paymentStreams'));
 registerRoute('/', '/products/bulk', require('./bulkUpload'));
 registerRoute('/', '/coupons', require('./coupons'));
 registerRoute('/', '/alerts', require('./alerts'));
@@ -385,14 +386,6 @@ registerRoute('/', '', require('./export'));
 registerRoute('/', '/announcements', require('./announcements'));
 registerRoute('/', '/auctions', require('./auctions'));
 
-router.use('/api/coupons',    require('./coupons'));
-router.use('/api/export',     require('./export'));
-router.use('/api/categories', require('./categories'));
-router.use('/api/reviews',    require('./reviews'));
-
-router.use('/api/coupons',    require('./coupons'));
-router.use('/api/export',     require('./export'));
-router.use('/api/categories', require('./categories'));
-router.use('/api/reviews',    require('./reviews'));
+registerRoute('/', '/categories', require('./categories'));
 
 module.exports = router;
