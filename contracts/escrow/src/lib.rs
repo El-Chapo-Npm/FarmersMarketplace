@@ -46,49 +46,53 @@ const MAX_COOP_SIGNERS: u32 = 15;
 /// Maximum limit for paginated escrow queries to prevent excessive read costs. (#980)
 const MAX_ESCROW_PAGE_SIZE: u32 = 100;
 
+// ---------------------------------------------------------------------------
+// EscrowError discriminant registry
+// Each variant has a stable u32 code that is part of the on-chain ABI.
+// NEVER reuse a code, even after removing a variant.
+// When adding a new variant, use NEXT_CODE and increment it.
+// NEXT_CODE: 23
+// ---------------------------------------------------------------------------
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum EscrowError {
-    NotFound = 1,
-    AlreadySettled = 2,
-    InDispute = 3,
-    Unauthorized = 4,
-    InvalidAmount = 5,
-    AlreadyExists = 6,
-    TimeoutNotReached = 7,
-    InvalidWasmHash = 8,
-    NoPendingAdmin = 9,
+    NotFound               = 1,
+    AlreadySettled         = 2,
+    InDispute              = 3,
+    Unauthorized           = 4,
+    InvalidAmount          = 5,
+    AlreadyExists          = 6,
+    TimeoutNotReached      = 7,
+    InvalidWasmHash        = 8,
+    NoPendingAdmin         = 9,
     /// Provided token does not match the token used at deposit time.
-    InvalidToken = 10,
+    InvalidToken           = 10,
     /// A v1 EscrowRecord entry could not be migrated to v2 Escrow.
-    MigrationFailed = 11,
+    MigrationFailed        = 11,
     /// Fewer valid signatures than the cooperative threshold.
-    NotEnoughSignatures = 12,
+    NotEnoughSignatures    = 12,
     /// Cooperative members / threshold not yet configured.
-    CoopNotConfigured = 13,
+    CoopNotConfigured      = 13,
     /// Contract has already been initialized. (#837)
-    AlreadyInitialized = 14,
+    AlreadyInitialized     = 14,
     /// Caller is not the platform admin or does not hold the required role. (#837)
-    NotAdmin = 15,
-    /// Deposit amount is below the configured minimum (dust). (#857)
-    /// (Issue suggested extending InvalidAmount; a dedicated variant is clearer.
-    /// Code 16 is used because 12/8 are already taken by other variants.)
-    BelowMinDeposit = 16,
+    NotAdmin               = 15,
+    /// Deposit amount is below the configured minimum (dust guard). (#857)
+    BelowMinDeposit        = 16,
     /// `batch_release` was called with more than `MAX_BATCH_RELEASE` order IDs. (#856)
-    /// (Issue suggested code 12, but that is already `NotEnoughSignatures`; 17 is used.)
-    BatchTooLarge = 17,
-    /// No escrow snapshot exists for the requested (order_id, ledger_sequence). (#858)
-    /// (Issue referenced code 8, but that is already `InvalidWasmHash` here; 18 is used.)
-    SnapshotNotFound = 18,
+    BatchTooLarge          = 17,
+    /// No snapshot exists for the requested (order_id, ledger_sequence). (#858)
+    SnapshotNotFound       = 18,
+    /// Release called before the pre-order unlock date. (#875)
+    NotYetReleasable       = 19,
     /// Evidence submission window has closed (48 hours after dispute opened). (#877)
     SubmissionWindowClosed = 20,
     /// Auto-release time has not yet been reached. (#878)
+    AutoReleaseNotReached  = 21,
     AutoReleaseNotReached = 21,
     /// Cooperative signer configuration exceeds maximum allowed. (#979)
     TooManyCoopSigners     = 22,
-    /// Release called before the pre-order unlock date. (#875)
-    NotYetReleasable = 19,
 }
 
 #[derive(Clone, Debug, PartialEq)]
