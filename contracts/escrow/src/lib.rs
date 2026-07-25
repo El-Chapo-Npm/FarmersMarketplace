@@ -1,5 +1,6 @@
 #![no_std]
 
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Address, Env};
 mod errors;
 
 use errors::EscrowError;
@@ -628,6 +629,10 @@ impl EscrowContract {
             return Err(EscrowError::NotYetReleasable);
         }
 
+        escrow.released = true;
+        env.storage().persistent().set(&DataKey::Escrow(order_id), &escrow);
+        env.events()
+            .publish((symbol_short!("release"), order_id), escrow.amount);
         // Verify the token stored at deposit time matches the escrow record.
         let stored_token: Address = env
             .storage()
