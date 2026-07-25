@@ -362,6 +362,7 @@ registerRoute('/', '/messages', require('./messages'));
 registerRoute('/', '/notifications', require('./notifications'));
 registerRoute('/', '/contracts', require('./contracts'));
 registerRoute('/', '/escrow', require('./escrow'));
+registerRoute('/', '/paymentStreams', require('./paymentStreams'));
 registerRoute('/', '/products/bulk', require('./bulkUpload'));
 registerRoute('/', '/coupons', require('./coupons'));
 registerRoute('/', '/alerts', require('./alerts'));
