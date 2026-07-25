@@ -150,6 +150,12 @@ fn get_admin(env: &Env) -> Address {
 
 // ── Contract ──────────────────────────────────────────────────────────────────
 
+// TTL bump applied to instance storage on every write so the escrow record doesn't
+// get archived between create() and submit_work()/approve()/cancel()/expire() (in
+// ledgers, ~5s each): ~6 days threshold, ~30 days bump.
+const BUMP_THRESHOLD: u32 = 100_000;
+const BUMP_AMOUNT: u32 = 500_000;
+
 #[contract]
 pub struct EscrowContract;
 
@@ -190,6 +196,28 @@ impl EscrowContract {
         Ok(())
     }
 
+        let data = EscrowData {
+            payer: payer.clone(),
+            freelancer,
+            token: token.clone(),
+            amount,
+            status: EscrowStatus::Active,
+            deadline,
+        };
+
+        // Effects before interactions: the escrow record is written before the token
+        // transfer below so a reentrant create() call (triggered by a malicious
+        // token/callback during the transfer) sees `has(&symbol_short!("escrow")) ==
+        // true` and is rejected, instead of racing past the check above.
+        env.storage().instance().set(&symbol_short!("escrow"), &data);
+        env.storage().instance().extend_ttl(BUMP_THRESHOLD, BUMP_AMOUNT);
+
+        // Transfer funds from payer into the contract
+        TokenClient::new(&env, &token).transfer(
+            &payer,
+            &env.current_contract_address(),
+            &amount,
+        );
     // ── #855 ──────────────────────────────────────────────────────────────────
     /// Update the platform fee rate. Admin-only.
     ///
@@ -245,6 +273,9 @@ impl EscrowContract {
         let admin = get_admin(&env);
         admin.require_auth();
 
+        data.status = EscrowStatus::WorkSubmitted;
+        env.storage().instance().set(&symbol_short!("escrow"), &data);
+        env.storage().instance().extend_ttl(BUMP_THRESHOLD, BUMP_AMOUNT);
         env.storage().instance().set(&DataKey::Paused, &true);
         env.storage().instance().extend_ttl(TTL_MIN, TTL_MAX);
 
@@ -290,6 +321,17 @@ impl EscrowContract {
             env.storage().instance().set(&DataKey::UnpauseVotes, &votes);
             env.storage().instance().extend_ttl(TTL_MIN, TTL_MAX);
         }
+
+        // Effects before interactions — see create() above.
+        data.status = EscrowStatus::Approved;
+        env.storage().instance().set(&symbol_short!("escrow"), &data);
+        env.storage().instance().extend_ttl(BUMP_THRESHOLD, BUMP_AMOUNT);
+
+        TokenClient::new(&env, &data.token).transfer(
+            &env.current_contract_address(),
+            &data.freelancer,
+            &data.amount,
+        );
 
         if votes.len() >= UNPAUSE_THRESHOLD {
             env.storage().instance().set(&DataKey::Paused, &false);
@@ -385,6 +427,17 @@ impl EscrowContract {
             return Err(EscrowError::AlreadySettled);
         }
 
+        // Effects before interactions — see create() above.
+        data.status = EscrowStatus::Cancelled;
+        env.storage().instance().set(&symbol_short!("escrow"), &data);
+        env.storage().instance().extend_ttl(BUMP_THRESHOLD, BUMP_AMOUNT);
+
+        TokenClient::new(&env, &data.token).transfer(
+            &env.current_contract_address(),
+            &data.payer,
+            &data.amount,
+        );
+
         record.buyer.require_auth();
 
         let expected_hash = compute_product_hash(&env, &product_name, price_stroops);
@@ -433,6 +486,17 @@ impl EscrowContract {
         if now < record.timeout_unix {
             return Err(EscrowError::NotTimedOut);
         }
+
+        // Effects before interactions — see create() above.
+        data.status = EscrowStatus::Expired;
+        env.storage().instance().set(&symbol_short!("escrow"), &data);
+        env.storage().instance().extend_ttl(BUMP_THRESHOLD, BUMP_AMOUNT);
+
+        TokenClient::new(&env, &data.token).transfer(
+            &env.current_contract_address(),
+            &data.payer,
+            &data.amount,
+        );
 
         let refund_amount = match amount {
             Some(n) => {
