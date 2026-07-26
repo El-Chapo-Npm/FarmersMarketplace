@@ -118,6 +118,15 @@ jest.mock('../src/routes', () => {
   router.use('/api/notifications', require('../src/routes/notifications'));
   router.use('/api/creator-earnings', require('../src/routes/creatorEarnings'));
   router.use('/api/admin', require('../src/routes/admin'));
+  // #1004 bundles & bundle-discounts
+  router.use('/api/bundles', require('../src/routes/bundles'));
+  router.use('/api/farmers', require('../src/routes/bundleDiscounts'));
+  // #1005 product import
+  router.use('/api/products/import', require('../src/routes/productImport'));
+  // #1006 product videos
+  router.use('/api/products', require('../src/routes/productVideos'));
+  // #1007 product share
+  router.use('/api/products', require('../src/routes/productShare'));
   return router;
 });
 
