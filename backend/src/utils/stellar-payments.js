@@ -17,11 +17,11 @@ async function wrapWithFeeBump(innerTx, feeAccountSecret) {
 /**
  * Sends XLM from one account to another, splitting off the platform fee when configured.
  * Wraps the transaction in a fee-bump if the sender's balance is below `FEE_BUMP_THRESHOLD_XLM`.
- * @param {{ senderSecret: string, receiverPublicKey: string, amount: number, memo?: string }} params
+ * @param {{ senderSecret: string, receiverPublicKey: string, amount: number, memo?: string, requestId?: string }} params
  * @returns {Promise<string>} Transaction hash
  * @throws {{ code: 'account_not_found' }} if the sender account is not funded
  */
-async function sendPayment({ senderSecret, receiverPublicKey, amount, memo }) {
+async function sendPayment({ senderSecret, receiverPublicKey, amount, memo, requestId }) {
   const senderKeypair = StellarSdk.Keypair.fromSecret(senderSecret);
   let senderAccount;
   try {
@@ -81,6 +81,14 @@ async function sendPayment({ senderSecret, receiverPublicKey, amount, memo }) {
   }
 
   const result = await server.submitTransaction(txToSubmit);
+  console.log(JSON.stringify({
+    requestId: requestId || null,
+    event: 'stellar_payment_submitted',
+    txHash: result.hash,
+    from: senderKeypair.publicKey(),
+    to: receiverPublicKey,
+    amount,
+  }));
   return result.hash;
 }
 

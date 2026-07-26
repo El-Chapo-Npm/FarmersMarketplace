@@ -283,11 +283,11 @@ async function simulateContractCall(contractId, method, args = []) {
 /**
  * Invokes a lifecycle action on the Soroban escrow contract and polls until confirmed.
  * Logs every attempt to `contract_invocations`.
- * @param {{ action: 'deposit'|'release'|'refund'|'dispute', senderSecret: string, orderId: number, buyerPublicKey: string, farmerPublicKey: string, amount: number, timeoutUnix: number, userId: number|null, cooperativeAddress?: string|null, cooperativeRoyaltyBps?: number }} params
+ * @param {{ action: 'deposit'|'release'|'refund'|'dispute', senderSecret: string, orderId: number, buyerPublicKey: string, farmerPublicKey: string, amount: number, timeoutUnix: number, userId: number|null, cooperativeAddress?: string|null, cooperativeRoyaltyBps?: number, requestId?: string }} params
  * @returns {Promise<{ txHash: string, contractId: string }>}
  * @throws if the contract IDs are unconfigured, submission fails, or confirmation times out after 15 s
  */
-async function invokeEscrowContract({ action, senderSecret, orderId, buyerPublicKey, farmerPublicKey, amount, timeoutUnix, userId, cooperativeAddress, cooperativeRoyaltyBps, releaseAfterUnix }) {
+async function invokeEscrowContract({ action, senderSecret, orderId, buyerPublicKey, farmerPublicKey, amount, timeoutUnix, userId, cooperativeAddress, cooperativeRoyaltyBps, releaseAfterUnix, requestId }) {
   const contractId = config.sorobanEscrowContractId;
   const xlmTokenContractId = config.sorobanXlmTokenContractId;
   if (!contractId) throw new Error('SOROBAN_ESCROW_CONTRACT_ID is not configured');
@@ -352,24 +352,29 @@ async function invokeEscrowContract({ action, senderSecret, orderId, buyerPublic
   try {
     sendResult = await sorobanServer.sendTransaction(tx);
   } catch (submitErr) {
+    console.log(JSON.stringify({ requestId: requestId || null, event: 'soroban_rpc_submit_error', contractId, action, orderId, error: submitErr.message }));
     await logEscrowInvocation({ contractId, method: action, args: logArgs, txHash: null, success: false, error: submitErr.message, userId });
     throw submitErr;
   }
 
   if (sendResult.status === 'ERROR') {
     const errMsg = sendResult.errorResultXdr || 'Soroban transaction submission failed';
+    console.log(JSON.stringify({ requestId: requestId || null, event: 'soroban_rpc_submit_error', contractId, action, orderId, error: errMsg }));
     await logEscrowInvocation({ contractId, method: action, args: logArgs, txHash: null, success: false, error: errMsg, userId });
     throw new Error(errMsg);
   }
 
   const hash = sendResult.hash || tx.hash().toString('hex');
+  console.log(JSON.stringify({ requestId: requestId || null, event: 'soroban_rpc_submitted', contractId, action, orderId, txHash: hash }));
   for (let i = 0; i < 15; i += 1) {
     const txResult = await sorobanServer.getTransaction(hash);
     if (txResult.status === 'SUCCESS') {
+      console.log(JSON.stringify({ requestId: requestId || null, event: 'soroban_rpc_confirmed', contractId, action, orderId, txHash: hash }));
       await logEscrowInvocation({ contractId, method: action, args: logArgs, txHash: hash, success: true, error: null, userId });
       return { txHash: hash, contractId };
     }
     if (txResult.status === 'FAILED') {
+      console.log(JSON.stringify({ requestId: requestId || null, event: 'soroban_rpc_failed', contractId, action, orderId, txHash: hash }));
       await logEscrowInvocation({ contractId, method: action, args: logArgs, txHash: hash, success: false, error: 'Soroban transaction failed', userId });
       throw new Error('Soroban transaction failed');
     }
@@ -377,6 +382,7 @@ async function invokeEscrowContract({ action, senderSecret, orderId, buyerPublic
   }
 
   const timeoutErr = 'Soroban transaction confirmation timed out';
+  console.log(JSON.stringify({ requestId: requestId || null, event: 'soroban_rpc_timeout', contractId, action, orderId, txHash: hash }));
   await logEscrowInvocation({ contractId, method: action, args: logArgs, txHash: hash, success: false, error: timeoutErr, userId });
   throw new Error(timeoutErr);
 }
