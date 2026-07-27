@@ -136,6 +136,32 @@ describe('POST /api/orders', () => {
     expect(res.status).toBe(402);
     expect(res.body.orderId).toBeDefined();
   });
+
+  it('returns 400 for zero quantity', async () => {
+    const { token: csrf, cookieStr } = await getCsrf();
+    const res = await request(app)
+      .post('/api/orders')
+      .set('Authorization', `Bearer ${buyerToken}`)
+      .set('Cookie', cookieStr)
+      .set('X-CSRF-Token', csrf)
+      .send({ product_id: 10, quantity: 0 });
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe('validation_error');
+    expect(res.body.message).toBe('quantity must be a positive integer');
+  });
+
+  it('returns 400 for negative quantity', async () => {
+    const { token: csrf, cookieStr } = await getCsrf();
+    const res = await request(app)
+      .post('/api/orders')
+      .set('Authorization', `Bearer ${buyerToken}`)
+      .set('Cookie', cookieStr)
+      .set('X-CSRF-Token', csrf)
+      .send({ product_id: 10, quantity: -5 });
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe('validation_error');
+    expect(res.body.message).toBe('quantity must be a positive integer');
+  });
 });
 
 describe('GET /api/orders', () => {
