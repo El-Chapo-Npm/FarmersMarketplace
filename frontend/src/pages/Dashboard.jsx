@@ -18,18 +18,6 @@ const s = {
   msg: { padding: '10px 14px', borderRadius: 8, marginBottom: 12, fontSize: 14 },
 };
 
-function getEmptyForm() {
-  return {
-    name: '',
-    description: '',
-    price: '',
-    quantity: '',
-    unit: 'kg',
-    category: 'other',
-    is_preorder: false,
-    preorder_delivery_date: '',
-  };
-}
 const EMPTY_FORM = {
   name: '',
   description: '',
@@ -74,7 +62,6 @@ export default function Dashboard() {
   const { user } = useAuth();
   const { t } = useTranslation();
   const [products, setProducts] = useState([]);
-  const [form, setForm] = useState(getEmptyForm);
   const [restockVals, setRestockVals] = useState({});
   const [form, setForm] = useState({ ...EMPTY_FORM });
   const [harvestBatches, setHarvestBatches] = useState([]);
@@ -94,6 +81,11 @@ export default function Dashboard() {
   const [error, setError] = useState(null);
   const [flashSaleForm, setFlashSaleForm] = useState({ product_id: '', flash_sale_price: '', flash_sale_ends_at: '' });
   const [flashSaleMsg, setFlashSaleMsg] = useState(null);
+
+  // Creator earnings
+  const [earnings, setEarnings] = useState(null);
+  const [claiming, setClaiming] = useState(false);
+  const [claimMsg, setClaimMsg] = useState(null);
 
   // bulk price update state
   const [bulkPriceSelections, setBulkPriceSelections] = useState({}); // { [productId]: newPrice }
@@ -309,7 +301,24 @@ export default function Dashboard() {
         })
         .catch(() => {});
     }
+    if (typeof api.getCreatorEarnings === 'function') {
+      api.getCreatorEarnings().then(res => setEarnings(res.data ?? res)).catch(() => {});
+    }
   }, [user?.id]);
+
+  async function handleClaimEarnings() {
+    setClaiming(true);
+    setClaimMsg(null);
+    try {
+      await api.claimCreatorEarnings();
+      setEarnings(prev => (prev ? { ...prev, balance: 0 } : prev));
+      setClaimMsg({ type: 'ok', text: 'Earnings claimed successfully.' });
+    } catch (e) {
+      setClaimMsg({ type: 'err', text: getErrorMessage(e) });
+    } finally {
+      setClaiming(false);
+    }
+  }
 
   async function handleCreateBatch(e) {
     e?.preventDefault?.();
@@ -467,7 +476,6 @@ export default function Dashboard() {
         batch_id: Number.isFinite(batchId) ? batchId : undefined,
       });
       setMsg({ type: 'ok', text: t('dashboard.productListedOk') });
-      setForm(getEmptyForm());
       setForm({ ...EMPTY_FORM });
       removeImage();
       load();
@@ -664,6 +672,26 @@ export default function Dashboard() {
           </table>
         </div>
       )}
+
+      <div style={{ ...s.card, marginBottom: 24 }}>
+        <h3 style={{ marginBottom: 12, color: '#333' }}>💰 Creator Earnings</h3>
+        <div style={{ fontSize: 28, fontWeight: 700, color: '#2d6a4f' }}>
+          {earnings ? Number(earnings.balance ?? 0).toFixed(2) : '-'} XLM
+        </div>
+        <div style={{ fontSize: 13, color: '#888', marginTop: 4 }}>Accumulated on-chain earnings available to claim.</div>
+        <button
+          style={{ ...s.btn, marginTop: 14, opacity: !earnings || Number(earnings.balance ?? 0) <= 0 ? 0.5 : 1 }}
+          disabled={claiming || !earnings || Number(earnings.balance ?? 0) <= 0}
+          onClick={handleClaimEarnings}
+        >
+          {claiming ? 'Claiming...' : 'Claim Earnings'}
+        </button>
+        {claimMsg && (
+          <div role="status" style={{ ...s.msg, marginTop: 12, background: claimMsg.type === 'ok' ? '#d8f3dc' : '#fee', color: claimMsg.type === 'ok' ? '#2d6a4f' : '#c0392b' }}>
+            {claimMsg.text}
+          </div>
+        )}
+      </div>
 
       <div style={{ ...s.card, marginBottom: 24 }}>
         <h3 style={{ marginBottom: 12, color: '#333' }}>Flash Sales</h3>
@@ -1145,12 +1173,6 @@ export default function Dashboard() {
           </div>
           {products.length === 0 && <p style={{ color: '#888', fontSize: 14 }}>No products yet. Add your first listing.</p>}
           {products.map(p => (
-            <div key={p.id} style={s.product}>
-              <div>
-                <div style={{ fontWeight: 600 }}>{p.name}</div>
-                <div style={{ fontSize: 13, color: '#666' }}>{p.price} XLM · {p.quantity} {p.unit}</div>
-              </div>
-              <button style={s.del} onClick={() => handleDelete(p.id)} aria-label={`Remove ${p.name}`}>Remove</button>
             <div key={p.id} style={{ ...s.product, flexDirection: 'column', alignItems: 'stretch' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                 <div style={{ display: 'flex', alignItems: 'center' }}>
