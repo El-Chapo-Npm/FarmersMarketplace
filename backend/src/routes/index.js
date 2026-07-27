@@ -1,5 +1,6 @@
 const router = require('express').Router();
 const rateLimit = require('express-rate-limit');
+const { createRateLimitPerUser } = require('../middleware/rateLimitPerUser');
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -19,16 +20,20 @@ const orderLimiter = rateLimit({
   standardHeaders: true, legacyHeaders: false,
   message: { success: false, error: 'Too many orders, slow down', code: 'rate_limited' },
 });
-const fundLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000, max: 5,
-  standardHeaders: true, legacyHeaders: false,
-  message: { success: false, error: 'Funding limit reached, try again in an hour', code: 'rate_limited' },
+
+// Per-user Redis-backed rate limiters for wallet operations
+const fundLimiter = createRateLimitPerUser({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 5,
+  message: 'Funding limit reached, try again in an hour',
+  code: 'rate_limited'
 });
-const sendLimiter = rateLimit({
-  windowMs: 60 * 1000,
+
+const sendLimiter = createRateLimitPerUser({
+  windowMs: 60 * 1000, // 1 minute
   max: parseInt(process.env.RATE_LIMIT_SEND_MAX || '5'),
-  standardHeaders: true, legacyHeaders: false,
-  message: { success: false, error: 'Too many send requests, slow down', code: 'rate_limited' },
+  message: 'Too many send requests, slow down',
+  code: 'rate_limited'
 });
 
 // Health checks (before rate limiting)
