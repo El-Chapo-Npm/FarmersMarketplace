@@ -238,13 +238,18 @@ async function createPreorderClaimableBalance({
   return { txHash: result.hash, balanceId: balance.id };
 }
 
-async function getContractState(contractId, prefix = null) {
+// Get the shared Soroban RPC server instance
+function getSorobanServer() {
   const sorobanRpcUrl =
     process.env.SOROBAN_RPC_URL ||
     (isTestnet
       ? "https://soroban-testnet.stellar.org"
       : "https://soroban.stellar.org");
-  const sorobanServer = new StellarSdk.SorobanRpc.Server(sorobanRpcUrl);
+  return new StellarSdk.SorobanRpc.Server(sorobanRpcUrl);
+}
+
+async function getContractState(contractId, prefix = null) {
+  const sorobanServer = getSorobanServer();
 
   const entries = [];
   let hasMore = true;
@@ -265,6 +270,39 @@ async function getContractState(contractId, prefix = null) {
   }
 
   return entries;
+}
+
+// Health check for Soroban RPC endpoint
+async function checkSorobanRPC() {
+  const startTime = Date.now();
+  try {
+    const sorobanServer = getSorobanServer();
+    // Use getHealth method from SorobanRpc.Server
+    const healthResponse = await sorobanServer.getHealth();
+    const responseTime = Date.now() - startTime;
+    
+    return {
+      status: 'healthy',
+      responseTime,
+      details: {
+        status: healthResponse.status,
+        latestLedger: healthResponse.latestLedger,
+        oldestLedger: healthResponse.oldestLedger,
+        ledgerRetentionWindow: healthResponse.ledgerRetentionWindow
+      }
+    };
+  } catch (error) {
+    const responseTime = Date.now() - startTime;
+    return {
+      status: 'unhealthy',
+      responseTime,
+      error: error.message || 'Unknown error',
+      details: {
+        code: error.code,
+        type: error.constructor.name
+      }
+    };
+  }
 }
 
 // Resolve a federation address (e.g. farmer*farmersmarket.io) to a Stellar public key.
@@ -317,4 +355,6 @@ module.exports = {
   claimBalance,
   getContractState,
   resolveFederationAddress,
+  checkSorobanRPC,
+  getSorobanServer,
 };
