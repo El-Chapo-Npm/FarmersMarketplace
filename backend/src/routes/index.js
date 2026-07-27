@@ -385,6 +385,7 @@ registerRoute('/', '/farmers/bundles', require('./bundleDiscounts'));
 registerRoute('/', '', require('./export'));
 registerRoute('/', '/announcements', require('./announcements'));
 registerRoute('/', '/auctions', require('./auctions'));
+registerRoute('/', '/disputes', require('./disputes'));
 
 registerRoute('/', '/categories', require('./categories'));
 
