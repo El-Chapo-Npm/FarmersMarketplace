@@ -19,6 +19,7 @@ export function CompareProvider({ children }) {
         setHistory(JSON.parse(stored));
       }
     } catch (e) {
+      // eslint-disable-next-line no-console
       console.error('Failed to load comparison history:', e);
     }
   }, []);
@@ -48,6 +49,7 @@ export function CompareProvider({ children }) {
       try {
         localStorage.setItem(HISTORY_KEY, JSON.stringify(updated));
       } catch (e) {
+        // eslint-disable-next-line no-console
         console.error('Failed to save comparison history:', e);
       }
 
@@ -59,7 +61,7 @@ export function CompareProvider({ children }) {
     setProducts(prev => {
       if (prev.some(p => p.id === product.id)) return prev;
       const next = [...prev, product];
-      return next.length > 3 ? next.slice(1) : next;
+      return next.length > 4 ? next.slice(1) : next;
     });
   }, []);
 
@@ -72,7 +74,7 @@ export function CompareProvider({ children }) {
       const exists = prev.some(p => p.id === product.id);
       if (exists) return prev.filter(p => p.id !== product.id);
       const next = [...prev, product];
-      return next.length > 3 ? next.slice(1) : next;
+      return next.length > 4 ? next.slice(1) : next;
     });
   }, []);
 
@@ -90,6 +92,7 @@ export function CompareProvider({ children }) {
     try {
       localStorage.removeItem(HISTORY_KEY);
     } catch (e) {
+      // eslint-disable-next-line no-console
       console.error('Failed to clear comparison history:', e);
     }
   }, []);

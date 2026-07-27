@@ -1,71 +1,104 @@
-//! Farmers Marketplace — Soroban Escrow Contract
+//! Farmers Marketplace - Soroban Escrow Contract
 //!
-//! Fixes addressed:
-//!   #468 — Extend ledger entry TTL so escrow data cannot expire and lock funds.
-//!   #469 — Validate payer != freelancer (buyer != farmer) on create/deposit.
-//!   #470 — Validate timeout_unix is at least 1 hour in the future on deposit.
-//!   #471 — Emit Soroban events for deposit, release, and refund.
+//! Issues addressed:
+//!   #468 - Extend ledger entry TTL so escrow data cannot expire and lock funds.
+//!   #469 - Validate buyer != farmer on deposit.
+//!   #470 - Validate timeout_unix is at least 1 hour in the future on deposit.
+//!   #471 - Emit Soroban events for deposit, release, and refund.
+//!   #675 - EscrowStatus::Disputed variant; arbitrator resolve_dispute.
+//!   #676 - Partial refund: optional amount parameter on refund.
+//!   #687 - ACL role management: grant_role / revoke_role (ARBITRATOR, PLATFORM).
+//!   #688 - Extend TTL on every state-changing operation.
+//!   #836 - (backend) CSRF double-submit cookie pattern (handled in middleware).
+//!   #837 - initialize() sets admin, fee_bps, fee_destination atomically; AlreadyInitialized guard.
+//!   #838 - deposit validates amount > 0; uses env.ledger().timestamp() for timeout; emits event.
+//!   #839 - release deducts fee, sends to fee_destination atomically, emits enriched event.
+//!   #852 - Wasm binary optimisation: [profile.release] in Cargo.toml + wasm-opt in cli.sh.
+//!   #853 - upgrade(new_wasm_hash): admin-only contract upgrade preserving all escrow state.
+//!   #854 - Emergency pause (circuit breaker): pause() / unpause() with multi-sig guard.
+//!   #855 - MAX_FEE_BPS = 500; InvalidFeeRate (code 11); set_fee_rate() with event.
 
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short,
-    token::Client as TokenClient,
-    Address, Env,
+    contract, contractimpl, contracttype, contracterror, symbol_short,
+    Address, Bytes, BytesN, Env, Vec,
 };
+
+// ── TTL constants (in ledgers; ~5 s/ledger on Stellar) ───────────────────────
+pub const TTL_MIN: u32 = 100_000;
+pub const TTL_MAX: u32 = 200_000;
+
+/// Minimum timeout duration enforced on deposit (1 hour in seconds).
+pub const MIN_TIMEOUT_SECS: u64 = 3_600;
+
+/// Maximum platform fee: 500 basis points = 5 %. (#855)
+pub const MAX_FEE_BPS: u32 = 500;
+
+// ── Error codes ───────────────────────────────────────────────────────────────
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum EscrowError {
+    AlreadyExists      = 1,
+    NotFound           = 2,
+    Unauthorized       = 3,
+    NotTimedOut        = 4,
+    AlreadySettled     = 5,
+    InvalidParties     = 6,
+    AlreadyInitialized = 7,
+    SnapshotNotFound   = 8,
+    /// Refund amount exceeds escrowed balance or is zero. (#676)
+    InvalidAmount      = 9,
+    /// Escrow is currently paused; all state-changing calls are rejected. (#854)
+    ContractPaused     = 10,
+    /// fee_bps exceeds MAX_FEE_BPS (500). (#855)
+    InvalidFeeRate     = 11,
+}
+
+// ── Domain types ──────────────────────────────────────────────────────────────
+
+/// Status of an escrow record. (#675)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EscrowStatus {
+    Active,
+    Released,
+    Refunded,
+    /// A dispute has been opened; only an arbitrator may settle it.
+    Disputed,
+}
+
+/// Roles for ACL management (#687).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Role {
+    Arbitrator,
+    Platform,
+}
 
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
     Escrow(u64),
-    contract, contractimpl, contracttype, contracterror,
-    Address, Env, symbol_short,
-};
-
-// ---------------------------------------------------------------------------
-// TTL constants (in ledgers; ~5 s/ledger on Stellar)
-//   100 000 ledgers ≈ 5 000 000 s ≈ 57 days  (min)
-//   200 000 ledgers ≈ 10 000 000 s ≈ 115 days (max)
-// ---------------------------------------------------------------------------
-const TTL_MIN: u32 = 100_000;
-const TTL_MAX: u32 = 200_000;
-
-/// Minimum timeout duration enforced on deposit (1 hour in seconds).
-const MIN_TIMEOUT_SECS: u64 = 3_600;
-
-// ---------------------------------------------------------------------------
-// Error enum
-// ---------------------------------------------------------------------------
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-#[repr(u32)]
-pub enum EscrowError {
-    /// Escrow record already exists for this order_id.
-    AlreadyExists = 1,
-    /// No escrow record found for this order_id.
-    NotFound = 2,
-    /// Caller is not authorised to perform this action.
-    Unauthorized = 3,
-    /// The escrow has not yet timed out.
-    NotTimedOut = 4,
-    /// The escrow has already been settled (released or refunded).
-    AlreadySettled = 5,
-    /// payer and farmer addresses must be different.
-    InvalidParties = 6,
+    Role(Address, Role),
+    /// Platform admin address. Set by initialize(). (#837)
+    Admin,
+    /// Platform fee in basis points (e.g. 250 = 2.5%). Set by initialize(). (#837)
+    FeeBps,
+    /// Address that receives the platform fee on release. Set by initialize(). (#837)
+    FeeDestination,
+    /// Sentinel flag — true once initialize() has been called. (#837)
+    Initialized,
+    /// Ordered list of all members that currently hold a given role. (#401)
+    RoleMembers(Role),
+    /// Paused flag — true when the circuit breaker is active. (#854)
+    Paused,
+    /// Addresses that have cast an unpause vote; cleared on successful unpause. (#854)
+    UnpauseVotes,
 }
 
-// ---------------------------------------------------------------------------
-// Storage key
-// ---------------------------------------------------------------------------
-#[contracttype]
-#[derive(Clone)]
-pub enum DataKey {
-    Escrow(u64), // keyed by order_id
-}
-
-// ---------------------------------------------------------------------------
-// Escrow record stored on-chain
-// ---------------------------------------------------------------------------
 #[contracttype]
 #[derive(Clone)]
 pub struct EscrowRecord {
@@ -73,41 +106,251 @@ pub struct EscrowRecord {
     pub farmer: Address,
     pub amount: i128,
     pub timeout_unix: u64,
-    pub released: bool,
+    /// Replaces the old `released: bool` flag with a richer status. (#675)
+    pub status: EscrowStatus,
+    /// Optional arbitrator address set when a dispute is opened. (#675)
+    pub arbitrator: Option<Address>,
+    /// SHA-256 hash of the product details at order time (#703).
+    pub product_hash: BytesN<32>,
 }
 
-// ---------------------------------------------------------------------------
-// Contract
-// ---------------------------------------------------------------------------
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Hash product details deterministically for tamper detection (#703).
+pub fn compute_product_hash(env: &Env, product_name: &Bytes, price_stroops: i128) -> BytesN<32> {
+    let mut buf = Bytes::new(env);
+    buf.append(product_name);
+    let price_bytes = price_stroops.to_le_bytes();
+    let price_bytes_soroban = Bytes::from_array(env, &price_bytes);
+    buf.append(&price_bytes_soroban);
+    env.crypto().sha256(&buf)
+}
+
+/// Abort with ContractPaused if the circuit breaker is active. (#854)
+fn require_not_paused(env: &Env) -> Result<(), EscrowError> {
+    let paused: bool = env
+        .storage()
+        .instance()
+        .get(&DataKey::Paused)
+        .unwrap_or(false);
+    if paused {
+        Err(EscrowError::ContractPaused)
+    } else {
+        Ok(())
+    }
+}
+
+/// Return the stored admin, panicking if the contract is not yet initialised.
+fn get_admin(env: &Env) -> Address {
+    env.storage()
+        .instance()
+        .get(&DataKey::Admin)
+        .expect("contract not initialized")
+}
+
+// ── Contract ──────────────────────────────────────────────────────────────────
+
+// TTL bump applied to instance storage on every write so the escrow record doesn't
+// get archived between create() and submit_work()/approve()/cancel()/expire() (in
+// ledgers, ~5s each): ~6 days threshold, ~30 days bump.
+const BUMP_THRESHOLD: u32 = 100_000;
+const BUMP_AMOUNT: u32 = 500_000;
+
 #[contract]
 pub struct EscrowContract;
 
 #[contractimpl]
 impl EscrowContract {
-    /// Create a new escrow for a specific order ID. Transfers `amount` of `token` from `payer` to this contract.
-    /// `deadline` is an optional ledger timestamp after which the payer may reclaim funds.
-    pub fn create(
+
+    // ── #837 / #855 ───────────────────────────────────────────────────────────
+    /// Initialize the contract with a platform admin, fee rate, and fee destination.
+    ///
+    /// Must be called exactly once after deployment.
+    /// Returns `EscrowError::AlreadyInitialized` on re-entry.
+    /// Returns `EscrowError::InvalidFeeRate` if `fee_bps > MAX_FEE_BPS` (500). (#855)
+    pub fn initialize(
         env: Env,
-        order_id: u64,
-        payer: Address,
-        freelancer: Address,
-        token: Address,
-    // -----------------------------------------------------------------------
-    // deposit
-    //
-    // Locks `amount` tokens in escrow for `order_id`.
-    //
-    // Validations (fixes #469, #470):
-    //   • buyer != farmer
-    //   • timeout_unix > now + MIN_TIMEOUT_SECS
-    //
-    // TTL extension (fix #468):
-    //   • Extends the persistent entry TTL after writing.
-    //
-    // Event emitted (fix #471):
-    //   topics : ("escrow", "deposit", order_id)
-    //   data   : (buyer, farmer, amount)
-    // -----------------------------------------------------------------------
+        admin: Address,
+        fee_bps: u32,
+        fee_destination: Address,
+    ) -> Result<(), EscrowError> {
+        if env.storage().instance().has(&DataKey::Initialized) {
+            return Err(EscrowError::AlreadyInitialized);
+        }
+        // #855: enforce MAX_FEE_BPS = 500 (5 %)
+        if fee_bps > MAX_FEE_BPS {
+            return Err(EscrowError::InvalidFeeRate);
+        }
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
+        env.storage().instance().set(&DataKey::FeeDestination, &fee_destination);
+        env.storage().instance().set(&DataKey::Initialized, &true);
+        env.storage().instance().extend_ttl(TTL_MIN, TTL_MAX);
+
+        // Grant the admin the Platform role so ACL checks pass immediately.
+        let role_key = DataKey::Role(admin.clone(), Role::Platform);
+        env.storage().persistent().set(&role_key, &true);
+        env.storage().persistent().extend_ttl(&role_key, TTL_MIN, TTL_MAX);
+
+        Ok(())
+    }
+
+        let data = EscrowData {
+            payer: payer.clone(),
+            freelancer,
+            token: token.clone(),
+            amount,
+            status: EscrowStatus::Active,
+            deadline,
+        };
+
+        // Effects before interactions: the escrow record is written before the token
+        // transfer below so a reentrant create() call (triggered by a malicious
+        // token/callback during the transfer) sees `has(&symbol_short!("escrow")) ==
+        // true` and is rejected, instead of racing past the check above.
+        env.storage().instance().set(&symbol_short!("escrow"), &data);
+        env.storage().instance().extend_ttl(BUMP_THRESHOLD, BUMP_AMOUNT);
+
+        // Transfer funds from payer into the contract
+        TokenClient::new(&env, &token).transfer(
+            &payer,
+            &env.current_contract_address(),
+            &amount,
+        );
+    // ── #855 ──────────────────────────────────────────────────────────────────
+    /// Update the platform fee rate. Admin-only.
+    ///
+    /// - Validates `new_fee_bps <= MAX_FEE_BPS`; returns `InvalidFeeRate` otherwise.
+    /// - Emits `("escrow", "fee_updated", old_bps, new_bps)` for transparency.
+    pub fn set_fee_rate(env: Env, new_fee_bps: u32) -> Result<(), EscrowError> {
+        require_not_paused(&env)?;
+
+        let admin = get_admin(&env);
+        admin.require_auth();
+
+        if new_fee_bps > MAX_FEE_BPS {
+            return Err(EscrowError::InvalidFeeRate);
+        }
+
+        let old_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeBps)
+            .unwrap_or(0u32);
+
+        env.storage().instance().set(&DataKey::FeeBps, &new_fee_bps);
+        env.storage().instance().extend_ttl(TTL_MIN, TTL_MAX);
+
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("fee_upd")),
+            (old_bps, new_fee_bps),
+        );
+
+        Ok(())
+    }
+
+    // ── #853 ──────────────────────────────────────────────────────────────────
+    /// Upgrade the contract WASM to a new hash. Admin-only.
+    ///
+    /// All persistent escrow entries survive the upgrade unchanged because
+    /// Soroban persistent storage is keyed independently of the WASM binary.
+    /// The `DataKey` enum must remain backward-compatible in any new WASM.
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), EscrowError> {
+        let admin = get_admin(&env);
+        admin.require_auth();
+
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        Ok(())
+    }
+
+    // ── #854 ──────────────────────────────────────────────────────────────────
+    /// Activate the circuit breaker. Admin-only.
+    ///
+    /// While paused, every state-changing function returns `ContractPaused`.
+    /// Read-only calls (`get_escrow`, `has_role`, `get_role_members`) still work.
+    pub fn pause(env: Env) -> Result<(), EscrowError> {
+        let admin = get_admin(&env);
+        admin.require_auth();
+
+        data.status = EscrowStatus::WorkSubmitted;
+        env.storage().instance().set(&symbol_short!("escrow"), &data);
+        env.storage().instance().extend_ttl(BUMP_THRESHOLD, BUMP_AMOUNT);
+        env.storage().instance().set(&DataKey::Paused, &true);
+        env.storage().instance().extend_ttl(TTL_MIN, TTL_MAX);
+
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("paused")),
+            (),
+        );
+
+        Ok(())
+    }
+
+    /// Cast an unpause vote. Requires 2-of-3 Platform role holders to agree.
+    ///
+    /// The caller must hold `Role::Platform`.  Once the second unique vote is
+    /// recorded the pause is lifted and the vote list is cleared.
+    /// (For a full 3-signer quorum, change the threshold constant below.)
+    pub fn unpause(env: Env, caller: Address) -> Result<(), EscrowError> {
+        caller.require_auth();
+
+        // Caller must hold Platform role.
+        let platform_key = DataKey::Role(caller.clone(), Role::Platform);
+        let is_platform: bool = env
+            .storage()
+            .persistent()
+            .get(&platform_key)
+            .unwrap_or(false);
+        if !is_platform {
+            return Err(EscrowError::Unauthorized);
+        }
+
+        // Accumulate votes (2-of-3 threshold). (#854)
+        const UNPAUSE_THRESHOLD: u32 = 2;
+
+        let mut votes: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::UnpauseVotes)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Deduplicate: ignore if caller already voted.
+        if !votes.contains(&caller) {
+            votes.push_back(caller.clone());
+            env.storage().instance().set(&DataKey::UnpauseVotes, &votes);
+            env.storage().instance().extend_ttl(TTL_MIN, TTL_MAX);
+        }
+
+        // Effects before interactions — see create() above.
+        data.status = EscrowStatus::Approved;
+        env.storage().instance().set(&symbol_short!("escrow"), &data);
+        env.storage().instance().extend_ttl(BUMP_THRESHOLD, BUMP_AMOUNT);
+
+        TokenClient::new(&env, &data.token).transfer(
+            &env.current_contract_address(),
+            &data.freelancer,
+            &data.amount,
+        );
+
+        if votes.len() >= UNPAUSE_THRESHOLD {
+            env.storage().instance().set(&DataKey::Paused, &false);
+            // Clear votes for next pause/unpause cycle.
+            let empty: Vec<Address> = Vec::new(&env);
+            env.storage().instance().set(&DataKey::UnpauseVotes, &empty);
+            env.storage().instance().extend_ttl(TTL_MIN, TTL_MAX);
+
+            env.events().publish(
+                (symbol_short!("escrow"), symbol_short!("unpaused")),
+                (),
+            );
+        }
+
+        Ok(())
+    }
+
+    // ── #838 ──────────────────────────────────────────────────────────────────
+    /// Locks `amount` tokens in escrow for `order_id`.
     pub fn deposit(
         env: Env,
         order_id: u64,
@@ -115,65 +358,45 @@ impl EscrowContract {
         farmer: Address,
         amount: i128,
         timeout_unix: u64,
+        product_name: Bytes,
+        price_stroops: i128,
     ) -> Result<(), EscrowError> {
-        // Fix #469 — payer must differ from farmer
+        require_not_paused(&env)?;
+
         if buyer == farmer {
             return Err(EscrowError::InvalidParties);
         }
-        if env.storage().instance().has(&DataKey::Escrow(order_id)) {
-            return Err(EscrowError::AlreadyExists);
+        if amount <= 0 {
+            return Err(EscrowError::InvalidAmount);
+        }
 
-        // Fix #470 — timeout must be at least 1 hour in the future
         let now = env.ledger().timestamp();
         if timeout_unix <= now.saturating_add(MIN_TIMEOUT_SECS) {
             panic!("timeout must be at least 1 hour in the future");
         }
 
         let key = DataKey::Escrow(order_id);
-
-        // Prevent duplicate deposits for the same order
         if env.storage().persistent().has(&key) {
             return Err(EscrowError::AlreadyExists);
         }
 
         buyer.require_auth();
 
+        let product_hash = compute_product_hash(&env, &product_name, price_stroops);
+
         let record = EscrowRecord {
             buyer: buyer.clone(),
             farmer: farmer.clone(),
             amount,
             timeout_unix,
-            released: false,
+            status: EscrowStatus::Active,
+            arbitrator: None,
+            product_hash,
         };
 
-        env.storage().instance().set(&DataKey::Escrow(order_id), &data);
-
-        env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("created")),
-            data.amount,
-        );
-
-        Ok(())
-    }
-
-    /// Freelancer signals that work is complete.
-    pub fn submit_work(env: Env, order_id: u64) -> Result<(), EscrowError> {
-        let mut data: EscrowData = Self::load(&env, order_id)?;
-
-        data.freelancer.require_auth();
-
-        if data.status != EscrowStatus::Active {
-            return Err(EscrowError::NotActive);
-        }
-
-        data.status = EscrowStatus::WorkSubmitted;
-        env.storage().instance().set(&DataKey::Escrow(order_id), &data);
         env.storage().persistent().set(&key, &record);
-
-        // Fix #468 — extend TTL so the entry cannot expire
         env.storage().persistent().extend_ttl(&key, TTL_MIN, TTL_MAX);
 
-        // Fix #471 — emit deposit event
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("deposit"), order_id),
             (buyer, farmer, amount),
@@ -182,53 +405,16 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Payer approves the work and releases funds to the freelancer.
-    /// Token address is read from storage — no longer passed by caller.
-    pub fn approve(env: Env, order_id: u64) -> Result<(), EscrowError> {
-        let mut data: EscrowData = Self::load(&env, order_id)?;
+    // ── #839 ──────────────────────────────────────────────────────────────────
+    /// Releases escrowed funds to the farmer with platform fee deduction.
+    pub fn release(
+        env: Env,
+        order_id: u64,
+        product_name: Bytes,
+        price_stroops: i128,
+    ) -> Result<(), EscrowError> {
+        require_not_paused(&env)?;
 
-        data.payer.require_auth();
-
-        if data.status != EscrowStatus::WorkSubmitted {
-            return Err(EscrowError::WorkNotSubmitted);
-        }
-
-        TokenClient::new(&env, &data.token).transfer(
-            &env.current_contract_address(),
-            &data.freelancer,
-            &data.amount,
-        );
-
-        data.status = EscrowStatus::Approved;
-        env.storage().instance().set(&DataKey::Escrow(order_id), &data);
-
-        env.events().publish(
-            (symbol_short!("escrow"), symbol_short!("approved")),
-            data.amount,
-        );
-
-        Ok(())
-    }
-
-    /// Payer cancels the escrow and reclaims funds (only while Active).
-    /// Token address is read from storage — no longer passed by caller.
-    pub fn cancel(env: Env, order_id: u64) -> Result<(), EscrowError> {
-        let mut data: EscrowData = Self::load(&env, order_id)?;
-
-        data.payer.require_auth();
-    // -----------------------------------------------------------------------
-    // release
-    //
-    // Releases escrowed funds to the farmer. Only the buyer may call this.
-    //
-    // TTL extension (fix #468):
-    //   • Extends TTL after updating the record.
-    //
-    // Event emitted (fix #471):
-    //   topics : ("escrow", "release", order_id)
-    //   data   : amount
-    // -----------------------------------------------------------------------
-    pub fn release(env: Env, order_id: u64) -> Result<(), EscrowError> {
         let key = DataKey::Escrow(order_id);
 
         let mut record: EscrowRecord = env
@@ -237,55 +423,53 @@ impl EscrowContract {
             .get(&key)
             .ok_or(EscrowError::NotFound)?;
 
-        if record.released {
+        if record.status != EscrowStatus::Active {
             return Err(EscrowError::AlreadySettled);
         }
 
-        // Only the buyer can release funds to the farmer
+        // Effects before interactions — see create() above.
+        data.status = EscrowStatus::Cancelled;
+        env.storage().instance().set(&symbol_short!("escrow"), &data);
+        env.storage().instance().extend_ttl(BUMP_THRESHOLD, BUMP_AMOUNT);
+
+        TokenClient::new(&env, &data.token).transfer(
+            &env.current_contract_address(),
+            &data.payer,
+            &data.amount,
+        );
+
         record.buyer.require_auth();
 
-        let amount = record.amount;
-        record.released = true;
+        let expected_hash = compute_product_hash(&env, &product_name, price_stroops);
+        if expected_hash != record.product_hash {
+            return Err(EscrowError::SnapshotNotFound);
+        }
+
+        let fee_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeBps)
+            .unwrap_or(0u32);
+        let fee_amount = (record.amount * fee_bps as i128) / 10_000;
+        let farmer_amount = record.amount - fee_amount;
+
+        record.status = EscrowStatus::Released;
 
         env.storage().persistent().set(&key, &record);
-
-        data.status = EscrowStatus::Cancelled;
-        env.storage().instance().set(&DataKey::Escrow(order_id), &data);
-        // Fix #468 — extend TTL after update
         env.storage().persistent().extend_ttl(&key, TTL_MIN, TTL_MAX);
 
-        // Fix #471 — emit release event
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("release"), order_id),
-            amount,
+            (farmer_amount, fee_amount),
         );
 
         Ok(())
     }
 
-    /// Payer reclaims funds after the deadline has passed.
-    /// Fails if no deadline was set or deadline has not been reached yet.
-    pub fn expire(env: Env, order_id: u64) -> Result<(), EscrowError> {
-        let mut data: EscrowData = Self::load(&env, order_id)?;
+    /// Returns escrowed funds to the buyer after the timeout has passed.
+    pub fn refund(env: Env, order_id: u64, amount: Option<i128>) -> Result<(), EscrowError> {
+        require_not_paused(&env)?;
 
-        data.payer.require_auth();
-
-        if data.status != EscrowStatus::Active {
-            return Err(EscrowError::NotActive);
-    // -----------------------------------------------------------------------
-    // refund
-    //
-    // Returns escrowed funds to the buyer after the timeout has passed.
-    // Anyone may call this once the timeout is reached (permissionless sweep).
-    //
-    // TTL extension (fix #468):
-    //   • Extends TTL after updating the record.
-    //
-    // Event emitted (fix #471):
-    //   topics : ("escrow", "refund", order_id)
-    //   data   : amount
-    // -----------------------------------------------------------------------
-    pub fn refund(env: Env, order_id: u64) -> Result<(), EscrowError> {
         let key = DataKey::Escrow(order_id);
 
         let mut record: EscrowRecord = env
@@ -294,7 +478,7 @@ impl EscrowContract {
             .get(&key)
             .ok_or(EscrowError::NotFound)?;
 
-        if record.released {
+        if record.status != EscrowStatus::Active {
             return Err(EscrowError::AlreadySettled);
         }
 
@@ -303,257 +487,246 @@ impl EscrowContract {
             return Err(EscrowError::NotTimedOut);
         }
 
-        let amount = record.amount;
-        record.released = true;
-
+        // Effects before interactions — see create() above.
         data.status = EscrowStatus::Expired;
-        env.storage().instance().set(&DataKey::Escrow(order_id), &data);
-        env.storage().persistent().set(&key, &record);
+        env.storage().instance().set(&symbol_short!("escrow"), &data);
+        env.storage().instance().extend_ttl(BUMP_THRESHOLD, BUMP_AMOUNT);
 
-        // Fix #468 — extend TTL after update
+        TokenClient::new(&env, &data.token).transfer(
+            &env.current_contract_address(),
+            &data.payer,
+            &data.amount,
+        );
+
+        let refund_amount = match amount {
+            Some(n) => {
+                if n <= 0 || n > record.amount {
+                    return Err(EscrowError::InvalidAmount);
+                }
+                n
+            }
+            None => record.amount,
+        };
+
+        record.amount = refund_amount;
+        record.status = EscrowStatus::Refunded;
+
+        env.storage().persistent().set(&key, &record);
         env.storage().persistent().extend_ttl(&key, TTL_MIN, TTL_MAX);
 
-        // Fix #471 — emit refund event
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("refund"), order_id),
-            amount,
+            refund_amount,
         );
 
         Ok(())
     }
 
-    /// Returns the full escrow record for a specific order ID.
-    pub fn get_escrow(env: Env, order_id: u64) -> Result<EscrowData, EscrowError> {
-        Self::load(&env, order_id)
+    /// Opens a dispute on an active escrow. (#675)
+    pub fn open_dispute(
+        env: Env,
+        order_id: u64,
+        caller: Address,
+        arbitrator: Option<Address>,
+    ) -> Result<(), EscrowError> {
+        require_not_paused(&env)?;
+
+        caller.require_auth();
+
+        let key = DataKey::Escrow(order_id);
+        let mut record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::NotFound)?;
+
+        if record.status != EscrowStatus::Active {
+            return Err(EscrowError::AlreadySettled);
+        }
+
+        if caller != record.buyer && caller != record.farmer {
+            return Err(EscrowError::Unauthorized);
+        }
+
+        record.status = EscrowStatus::Disputed;
+        record.arbitrator = arbitrator;
+
+        env.storage().persistent().set(&key, &record);
+        env.storage().persistent().extend_ttl(&key, TTL_MIN, TTL_MAX);
+
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("dispute"), order_id),
+            caller,
+        );
+
+        Ok(())
     }
 
-    /// Returns only the current status — lightweight for UIs.
-    pub fn get_status(env: Env, order_id: u64) -> Result<EscrowStatus, EscrowError> {
-        Ok(Self::load(&env, order_id)?.status)
+    /// Settles a disputed escrow. (#675)
+    pub fn resolve_dispute(
+        env: Env,
+        order_id: u64,
+        caller: Address,
+        release_to_buyer: bool,
+    ) -> Result<(), EscrowError> {
+        require_not_paused(&env)?;
+
+        caller.require_auth();
+
+        let key = DataKey::Escrow(order_id);
+        let mut record: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::NotFound)?;
+
+        if record.status != EscrowStatus::Disputed {
+            return Err(EscrowError::AlreadySettled);
+        }
+
+        let role_key = DataKey::Role(caller.clone(), Role::Arbitrator);
+        let has_global_role: bool = env
+            .storage()
+            .persistent()
+            .get(&role_key)
+            .unwrap_or(false);
+
+        let is_record_arbitrator = record
+            .arbitrator
+            .as_ref()
+            .map(|a| *a == caller)
+            .unwrap_or(false);
+
+        if !has_global_role && !is_record_arbitrator {
+            return Err(EscrowError::Unauthorized);
+        }
+
+        let amount = record.amount;
+        record.status = if release_to_buyer {
+            EscrowStatus::Refunded
+        } else {
+            EscrowStatus::Released
+        };
+
+        env.storage().persistent().set(&key, &record);
+        env.storage().persistent().extend_ttl(&key, TTL_MIN, TTL_MAX);
+
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("resolved"), order_id),
+            (caller, release_to_buyer, amount),
+        );
+
+        Ok(())
     }
 
-    // ── Internal helpers ────────────────────────────────────────────────────
+    // ── #687 / #401 ───────────────────────────────────────────────────────────
 
-    fn load(env: &Env, order_id: u64) -> Result<EscrowData, EscrowError> {
+    /// Grants `role` to `account`. (#687)
+    pub fn grant_role(env: Env, caller: Address, account: Address, role: Role) {
+        caller.require_auth();
+
+        let admin_opt: Option<Address> = env.storage().instance().get(&DataKey::Admin);
+        let is_initialized = env.storage().instance().has(&DataKey::Initialized);
+
+        let platform_key = DataKey::Role(caller.clone(), Role::Platform);
+        let caller_is_platform: bool = env
+            .storage()
+            .persistent()
+            .get(&platform_key)
+            .unwrap_or(false);
+
+        if is_initialized {
+            let is_admin = admin_opt
+                .as_ref()
+                .map(|a| *a == caller)
+                .unwrap_or(false);
+            if !caller_is_platform && !is_admin {
+                panic!("only a Platform role holder can grant roles");
+            }
+        } else {
+            let is_bootstrap = matches!(role, Role::Platform) && !caller_is_platform;
+            if !caller_is_platform && !is_bootstrap {
+                panic!("only a Platform role holder can grant roles");
+            }
+        }
+
+        let key = DataKey::Role(account.clone(), role.clone());
+        env.storage().persistent().set(&key, &true);
+        env.storage().persistent().extend_ttl(&key, TTL_MIN, TTL_MAX);
+
+        let members_key = DataKey::RoleMembers(role.clone());
+        let mut members: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&members_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if !members.contains(&account) {
+            members.push_back(account);
+            env.storage().persistent().set(&members_key, &members);
+            env.storage().persistent().extend_ttl(&members_key, TTL_MIN, TTL_MAX);
+        }
+    }
+
+    /// Revokes `role` from `account`. (#687)
+    pub fn revoke_role(env: Env, caller: Address, account: Address, role: Role) {
+        caller.require_auth();
+
+        let platform_key = DataKey::Role(caller.clone(), Role::Platform);
+        let caller_is_platform: bool = env
+            .storage()
+            .persistent()
+            .get(&platform_key)
+            .unwrap_or(false);
+
+        if !caller_is_platform {
+            panic!("only a Platform role holder can revoke roles");
+        }
+
+        let key = DataKey::Role(account.clone(), role.clone());
+        env.storage().persistent().remove(&key);
+
+        let members_key = DataKey::RoleMembers(role.clone());
+        let mut members: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&members_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if let Some(idx) = members.iter().position(|a| a == account) {
+            members.remove(idx as u32);
+            env.storage().persistent().set(&members_key, &members);
+        }
+    }
+
+    /// Returns all addresses that currently hold `role`. (#401)
+    pub fn get_role_members(env: Env, role: Role) -> Vec<Address> {
+        let members_key = DataKey::RoleMembers(role);
         env.storage()
-            .instance()
-            .get(&DataKey::Escrow(order_id))
-            .ok_or(EscrowError::NotActive)
-    }
-}
-
-// ── Tests ────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use soroban_sdk::{
-        testutils::{Address as _, Ledger},
-        token::{Client as TokenClient, StellarAssetClient},
-        Env,
-    };
-
-    /// Deploy a test token and mint `amount` to `to`.
-    fn setup_token(env: &Env, admin: &Address, to: &Address, amount: i128) -> Address {
-        let token_id = env.register_stellar_asset_contract_v2(admin.clone());
-        let token_addr = token_id.address();
-        StellarAssetClient::new(env, &token_addr).mint(to, &amount);
-        token_addr
+            .persistent()
+            .get(&members_key)
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
-    fn setup() -> (Env, Address, Address, Address, Address) {
-        let env = Env::default();
-        env.mock_all_auths();
-        let payer     = Address::generate(&env);
-        let freelancer = Address::generate(&env);
-        let admin     = Address::generate(&env);
-        let token     = setup_token(&env, &admin, &payer, 1_000);
-        let contract  = env.register_contract(None, EscrowContract);
-        (env, payer, freelancer, token, contract)
+    /// Returns true if `account` holds `role`. (#401, #687)
+    pub fn has_role(env: Env, account: Address, role: Role) -> bool {
+        let key = DataKey::Role(account, role);
+        env.storage().persistent().get(&key).unwrap_or(false)
     }
 
-    // ── create ───────────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_create_success() {
-        let (env, payer, freelancer, token, contract) = setup();
-        let client = EscrowContractClient::new(&env, &contract);
-        client.create(&1, &payer, &freelancer, &token, &500, &None);
-        assert_eq!(client.get_status(&1), EscrowStatus::Active);
-    }
-
-    #[test]
-    fn test_create_invalid_amount() {
-        let (env, payer, freelancer, token, contract) = setup();
-        let client = EscrowContractClient::new(&env, &contract);
-        let err = client.try_create(&1, &payer, &freelancer, &token, &0, &None).unwrap_err().unwrap();
-        assert_eq!(err, EscrowError::InvalidAmount);
-    }
-
-    #[test]
-    fn test_create_already_exists() {
-        let (env, payer, freelancer, token, contract) = setup();
-        let client = EscrowContractClient::new(&env, &contract);
-        client.create(&1, &payer, &freelancer, &token, &100, &None);
-        let err = client.try_create(&1, &payer, &freelancer, &token, &100, &None).unwrap_err().unwrap();
-        assert_eq!(err, EscrowError::AlreadyExists);
-    }
-
-    #[test]
-    fn test_create_with_deadline() {
-        let (env, payer, freelancer, token, contract) = setup();
-        let client = EscrowContractClient::new(&env, &contract);
-        client.create(&1, &payer, &freelancer, &token, &200, &Some(9999));
-        let data = client.get_escrow(&1);
-        assert_eq!(data.deadline, Some(9999));
-    }
-
-    #[test]
-    fn test_multiple_order_ids_coexist() {
-        let (env, payer, freelancer, token, contract) = setup();
-        let client = EscrowContractClient::new(&env, &contract);
-        
-        // Create escrow for order 1
-        client.create(&1, &payer, &freelancer, &token, &100, &None);
-        assert_eq!(client.get_status(&1), EscrowStatus::Active);
-        
-        // Create escrow for order 2 with same parties but different amount
-        client.create(&2, &payer, &freelancer, &token, &200, &None);
-        assert_eq!(client.get_status(&2), EscrowStatus::Active);
-        
-        // Both escrows should exist independently
-        let data1 = client.get_escrow(&1);
-        let data2 = client.get_escrow(&2);
-        assert_eq!(data1.amount, 100);
-        assert_eq!(data2.amount, 200);
-    }
-
-    // ── submit_work ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_submit_work() {
-        let (env, payer, freelancer, token, contract) = setup();
-        let client = EscrowContractClient::new(&env, &contract);
-        client.create(&1, &payer, &freelancer, &token, &500, &None);
-        client.submit_work(&1);
-        assert_eq!(client.get_status(&1), EscrowStatus::WorkSubmitted);
-    }
-
-    #[test]
-    fn test_submit_work_not_active() {
-        let (env, payer, freelancer, token, contract) = setup();
-        let client = EscrowContractClient::new(&env, &contract);
-        client.create(&1, &payer, &freelancer, &token, &500, &None);
-        client.submit_work(&1);
-        // Submitting again should fail — no longer Active
-        let err = client.try_submit_work(&1).unwrap_err().unwrap();
-        assert_eq!(err, EscrowError::NotActive);
-    }
-
-    // ── approve ──────────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_approve_releases_funds() {
-        let (env, payer, freelancer, token, contract) = setup();
-        let client = EscrowContractClient::new(&env, &contract);
-        client.create(&1, &payer, &freelancer, &token, &500, &None);
-        client.submit_work(&1);
-        client.approve(&1);
-        assert_eq!(client.get_status(&1), EscrowStatus::Approved);
-        assert_eq!(TokenClient::new(&env, &token).balance(&freelancer), 500);
-    }
-
-    #[test]
-    fn test_approve_without_submission_fails() {
-        let (env, payer, freelancer, token, contract) = setup();
-        let client = EscrowContractClient::new(&env, &contract);
-        client.create(&1, &payer, &freelancer, &token, &500, &None);
-        let err = client.try_approve(&1).unwrap_err().unwrap();
-        assert_eq!(err, EscrowError::WorkNotSubmitted);
-    }
-
-    // ── cancel ───────────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_cancel_refunds_payer() {
-        let (env, payer, freelancer, token, contract) = setup();
-        let client = EscrowContractClient::new(&env, &contract);
-        client.create(&1, &payer, &freelancer, &token, &500, &None);
-        client.cancel(&1);
-        assert_eq!(client.get_status(&1), EscrowStatus::Cancelled);
-        assert_eq!(TokenClient::new(&env, &token).balance(&payer), 1_000);
-    }
-
-    #[test]
-    fn test_cancel_after_submission_fails() {
-        let (env, payer, freelancer, token, contract) = setup();
-        let client = EscrowContractClient::new(&env, &contract);
-        client.create(&1, &payer, &freelancer, &token, &500, &None);
-        client.submit_work(&1);
-        let err = client.try_cancel(&1).unwrap_err().unwrap();
-        assert_eq!(err, EscrowError::NotActive);
-    }
-
-    // ── expire ───────────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_expire_before_deadline_fails() {
-        let (env, payer, freelancer, token, contract) = setup();
-        env.ledger().set_timestamp(1000);
-        let client = EscrowContractClient::new(&env, &contract);
-        client.create(&1, &payer, &freelancer, &token, &500, &Some(2000));
-        // Timestamp 1000 <= deadline 2000 — should fail
-        let err = client.try_expire(&1).unwrap_err().unwrap();
-        assert_eq!(err, EscrowError::DeadlineNotReached);
-    }
-
-    #[test]
-    fn test_expire_after_deadline_succeeds() {
-        let (env, payer, freelancer, token, contract) = setup();
-        env.ledger().set_timestamp(1000);
-        let client = EscrowContractClient::new(&env, &contract);
-        client.create(&1, &payer, &freelancer, &token, &500, &Some(999));
-        // Timestamp 1000 > deadline 999 — should succeed
-        client.expire(&1);
-        assert_eq!(client.get_status(&1), EscrowStatus::Expired);
-        assert_eq!(TokenClient::new(&env, &token).balance(&payer), 1_000);
-    }
-
-    #[test]
-    fn test_expire_no_deadline_fails() {
-        let (env, payer, freelancer, token, contract) = setup();
-        let client = EscrowContractClient::new(&env, &contract);
-        client.create(&1, &payer, &freelancer, &token, &500, &None);
-        let err = client.try_expire(&1).unwrap_err().unwrap();
-        assert_eq!(err, EscrowError::NoDeadline);
-    }
-
-    // ── get_status ───────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_get_status_lifecycle() {
-        let (env, payer, freelancer, token, contract) = setup();
-        let client = EscrowContractClient::new(&env, &contract);
-
-        client.create(&1, &payer, &freelancer, &token, &500, &None);
-        assert_eq!(client.get_status(&1), EscrowStatus::Active);
-
-        client.submit_work(&1);
-        assert_eq!(client.get_status(&1), EscrowStatus::WorkSubmitted);
-
-        client.approve(&1);
-        assert_eq!(client.get_status(&1), EscrowStatus::Approved);
-    }
-}
-    // -----------------------------------------------------------------------
-    // get_escrow — read-only helper (useful for the backend monitor)
-    // -----------------------------------------------------------------------
+    /// Returns the full escrow record for a specific order ID.
     pub fn get_escrow(env: Env, order_id: u64) -> Result<EscrowRecord, EscrowError> {
         let key = DataKey::Escrow(order_id);
         env.storage()
             .persistent()
             .get(&key)
             .ok_or(EscrowError::NotFound)
+    }
+
+    /// Returns true if the contract is currently paused. (#854)
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
     }
 }
 

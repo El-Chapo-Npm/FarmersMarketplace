@@ -1,4 +1,5 @@
 const StellarSdk = require('@stellar/stellar-sdk');
+const { recordContractInvocation } = require('../jobs/contractMonitor');
 const bip39 = require('bip39');
 const StellarHDWallet = require('stellar-hd-wallet');
 
@@ -16,9 +17,6 @@ if (STELLAR_NETWORK === 'mainnet' && process.env.STELLAR_MAINNET_CONFIRMED !== '
 }
 
 const isTestnet = STELLAR_NETWORK === 'testnet';
-
-const sorobanRpcUrl = process.env.SOROBAN_RPC_URL || (isTestnet ? 'https://soroban-testnet.stellar.org' : 'https://soroban.stellar.org');
-const sorobanServer = new StellarSdk.SorobanRpc.Server(sorobanRpcUrl);
 
 const horizonUrl =
   process.env.STELLAR_HORIZON_URL ||
@@ -170,13 +168,11 @@ async function sendPayment({ senderSecret, receiverPublicKey, amount, memo }) {
   return result.hash;
 }
 
-async function getTransactions(publicKey, { cursor, limit = 20 } = {}) {
+async function getTransactions(publicKey) {
   try {
-    let call = server.payments().forAccount(publicKey).order('desc').limit(Math.min(limit, 200));
-    if (cursor) call = call.cursor(cursor);
-    const payments = await call.call();
+    const payments = await server.payments().forAccount(publicKey).order('desc').limit(20).call();
 
-    const records = payments.records
+    return payments.records
       .filter((p) => p.type === 'payment' && p.asset_type === 'native')
       .map((p) => ({
         id: p.id,
@@ -187,31 +183,20 @@ async function getTransactions(publicKey, { cursor, limit = 20 } = {}) {
         created_at: p.created_at,
         transaction_hash: p.transaction_hash,
       }));
-
-    // Extract cursors from Horizon paging tokens
-    const next_cursor = payments.records.length > 0
-      ? payments.records[payments.records.length - 1].paging_token
-      : null;
-    const prev_cursor = payments.records.length > 0
-      ? payments.records[0].paging_token
-      : null;
-
-    return { records, next_cursor, prev_cursor };
   } catch {
-    return { records: [], next_cursor: null, prev_cursor: null };
+    return [];
   }
 }
 
-function generatePaymentLink({ destination, amount, assetCode, assetIssuer, memo }) {
-  const params = new URLSearchParams({
-    destination,
-    amount,
-    asset_code: assetCode,
-    asset_issuer: assetIssuer,
-    ...(memo ? { memo, memo_type: 'text' } : {}),
-  });
-  return `web+stellar:pay?${params.toString()}`;
-}
+module.exports = {
+  isTestnet,
+  server,
+  createWallet,
+  fundTestnetAccount,
+  getBalance,
+  sendPayment,
+  getTransactions,
+};
 // In-memory cache: publicKey -> { federationAddress, expiresAt }
 const _federationCache = new Map();
 const FEDERATION_TTL_MS = 10 * 60 * 1000; // 10 minutes
@@ -251,15 +236,8 @@ module.exports = {
   getBalance,
   sendPayment,
   getTransactions,
-  generatePaymentLink,
 };
-
-async function createClaimableBalance({
-  senderSecret,
-  farmerPublicKey,
-  buyerPublicKey,
-  amount,
-}) {
+async function createClaimableBalance({ senderSecret, farmerPublicKey, buyerPublicKey, amount }) {
   const senderKeypair = StellarSdk.Keypair.fromSecret(senderSecret);
   const senderAccount = await server.loadAccount(senderKeypair.publicKey());
 
@@ -402,8 +380,7 @@ async function getContractState(contractId, prefix = null) {
       const key = data ? StellarSdk.scValToNative(data.key()) : String(entry.key);
       const val = data ? StellarSdk.scValToNative(data.val()) : null;
       const durability = data?.durability()?.name || 'Persistent';
-      const lastModifiedLedgerSeq = entry.lastModifiedLedgerSeq ?? null;
-      return { key: String(key), val, durability, lastModifiedLedgerSeq };
+      return { key: String(key), val, durability };
     })
     .filter((e) => !prefix || String(e.key).startsWith(prefix));
 
@@ -718,6 +695,12 @@ async function invokeEscrowContract({
   for (let i = 0; i < 15; i += 1) {
     const txResult = await sorobanServer.getTransaction(hash);
     if (txResult.status === 'SUCCESS') {
+      recordContractInvocation({
+        contractId,
+        action,
+        args: { orderId, buyerPublicKey, farmerPublicKey, amount, timeoutUnix },
+        txHash: hash,
+      }).catch(() => {});
       return { txHash: hash, contractId };
     }
     if (txResult.status === 'FAILED') {
@@ -727,6 +710,83 @@ async function invokeEscrowContract({
   }
 
   throw new Error('Soroban transaction confirmation timed out');
+}
+
+// Record a delivered order's carbon offset on the carbon_offset Soroban contract.
+// Only the platform (holder of CARBON_OFFSET_ADMIN_SECRET, matching the contract's
+// configured admin) can call this — the contract itself enforces that via require_auth.
+async function recordCarbonOffset({ orderId, kgCo2, verifierPublicKey }) {
+  const contractId = process.env.SOROBAN_CARBON_OFFSET_CONTRACT_ID;
+  const adminSecret = process.env.CARBON_OFFSET_ADMIN_SECRET;
+  if (!contractId) {
+    throw new Error('SOROBAN_CARBON_OFFSET_CONTRACT_ID is not configured');
+  }
+  if (!adminSecret) {
+    throw new Error('CARBON_OFFSET_ADMIN_SECRET is not configured');
+  }
+
+  const keypair = StellarSdk.Keypair.fromSecret(adminSecret);
+  const source = await server.loadAccount(keypair.publicKey());
+  const sorobanRpcUrl =
+    process.env.SOROBAN_RPC_URL ||
+    (isTestnet ? 'https://soroban-testnet.stellar.org' : 'https://soroban.stellar.org');
+  const sorobanServer = new StellarSdk.SorobanRpc.Server(sorobanRpcUrl);
+  const contract = new StellarSdk.Contract(contractId);
+
+  const operation = contract.call(
+    'record_offset',
+    StellarSdk.nativeToScVal(Number(orderId), { type: 'u64' }),
+    StellarSdk.nativeToScVal(Math.round(Number(kgCo2)), { type: 'u64' }),
+    StellarSdk.nativeToScVal(verifierPublicKey, { type: 'address' })
+  );
+
+  let tx = new StellarSdk.TransactionBuilder(source, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase,
+  })
+    .addOperation(operation)
+    .setTimeout(60)
+    .build();
+
+  tx = await sorobanServer.prepareTransaction(tx);
+  tx.sign(keypair);
+
+  const sendResult = await sorobanServer.sendTransaction(tx);
+  if (sendResult.status === 'ERROR') {
+    throw new Error(sendResult.errorResultXdr || 'Soroban transaction submission failed');
+  }
+
+  const hash = sendResult.hash || tx.hash().toString('hex');
+  for (let i = 0; i < 15; i += 1) {
+    const txResult = await sorobanServer.getTransaction(hash);
+    if (txResult.status === 'SUCCESS') {
+      recordContractInvocation({
+        contractId,
+        action: 'record_offset',
+        args: { orderId, kgCo2, verifierPublicKey },
+        txHash: hash,
+      }).catch(() => {});
+      return { txHash: hash, contractId };
+    }
+    if (txResult.status === 'FAILED') {
+      throw new Error('Soroban transaction failed');
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+
+  throw new Error('Soroban transaction confirmation timed out');
+}
+
+// Read an order's on-chain carbon offset record via the carbon_offset contract's
+// public get_offset function.
+async function getCarbonOffset(orderId) {
+  const contractId = process.env.SOROBAN_CARBON_OFFSET_CONTRACT_ID;
+  if (!contractId) {
+    throw new Error('SOROBAN_CARBON_OFFSET_CONTRACT_ID is not configured');
+  }
+  return simulateContractCall(contractId, 'get_offset', [
+    { type: 'u64', value: Number(orderId) },
+  ]);
 }
 
 // Resolve a federation address (e.g. farmer*farmersmarket.io) to a Stellar public key.
@@ -1205,261 +1265,45 @@ async function getContractEvents(contractId, filters = {}) {
   return { events: items, pagination: { page, pages, total, limit } };
 }
 
-/**
- * Fetch the function signatures exposed by a contract on the Soroban network.
- * Returns a Map of functionName → signature string, e.g. "(amount: i128) -> void".
- * @param {string} contractId  Contract address (base32 or hex)
- * @returns {Promise<Map<string, string>>}
- */
-async function getContractFunctionSignatures(contractId) {
-  const sorobanRpcUrl =
-    process.env.SOROBAN_RPC_URL ||
-    (isTestnet
-      ? 'https://soroban-testnet.stellar.org'
-      : 'https://soroban.stellar.org');
-  const sorobanServer = new StellarSdk.SorobanRpc.Server(sorobanRpcUrl);
-
-  const contractAddress = new StellarSdk.Address(contractId);
-  const ledgerKey = StellarSdk.xdr.LedgerKey.contractData(
-    new StellarSdk.xdr.LedgerKeyContractData({
-      contract: contractAddress.toScAddress(),
-      key: StellarSdk.xdr.ScVal.scvLedgerKeyContractInstance(),
-      durability: StellarSdk.xdr.ContractDataDurability.persistent(),
-    })
-  );
-
-  let response;
-  try {
-    response = await sorobanServer.getLedgerEntries(ledgerKey);
-  } catch (e) {
-    if (e.message?.includes('not found') || e.code === 404) {
-      const notFound = new Error('Contract not found');
-      notFound.code = 404;
-      throw notFound;
-    }
-    throw e;
-  }
-
-  const entries = response.entries || [];
-  if (!entries.length) {
-    const notFound = new Error('Contract instance not found on ledger');
-    notFound.code = 404;
-    throw notFound;
-  }
-
-  const data = entries[0].val?.contractData?.();
-  if (!data) return new Map();
-
-  const scVal = data.val();
-  let instance;
-  try {
-    instance = scVal.contractInstance();
-  } catch {
-    return new Map();
-  }
-
-  const spec = instance.contractSpec?.();
-  if (!spec || !spec.length) return new Map();
-
-  const signatures = new Map();
-  for (const entry of spec) {
-    try {
-      const fn = entry.functionV0?.();
-      if (!fn) continue;
-      const name = fn.name?.().toString() || '';
-      const inputs = (fn.inputs?.() || [])
-        .map((i) => `${i.name?.()}: ${i.type?.switch?.()?.name || 'unknown'}`)
-        .join(', ');
-      const outputs = (fn.outputs?.() || [])
-        .map((o) => o.switch?.()?.name || 'unknown')
-        .join(', ');
-      signatures.set(name, `(${inputs}) -> ${outputs || 'void'}`);
-    } catch {
-      // skip unparseable entries
-    }
-  }
-  return signatures;
- * Deploy a Soroban contract: upload WASM and instantiate.
- * @param {Buffer} wasmBuffer - The compiled WASM bytecode
- * @param {string} deployerSecret - Secret key of the deployer account
- * @returns {Promise<{ contractId: string, wasmHash: string, txHash: string }>}
- */
-async function deployContract({ wasmBuffer, deployerSecret }) {
-  const deployerKeypair = StellarSdk.Keypair.fromSecret(deployerSecret);
-  const deployerAccount = await server.loadAccount(deployerKeypair.publicKey());
-
-  const sorobanRpcUrl =
-    process.env.SOROBAN_RPC_URL ||
-    (isTestnet ? 'https://soroban-testnet.stellar.org' : 'https://soroban.stellar.org');
-  const sorobanServer = new StellarSdk.SorobanRpc.Server(sorobanRpcUrl);
-
-  // Step 1: Upload WASM
-  const wasmHash = StellarSdk.hash(wasmBuffer);
-  const uploadOp = StellarSdk.Operation.uploadContractWasm({
-    wasm: wasmBuffer,
-  });
-
-  let tx = new StellarSdk.TransactionBuilder(deployerAccount, {
-    fee: StellarSdk.BASE_FEE,
-    networkPassphrase,
-  })
-    .addOperation(uploadOp)
-    .setTimeout(60)
-    .build();
-
-  tx = await sorobanServer.prepareTransaction(tx);
-  tx.sign(deployerKeypair);
-
-  const uploadResult = await sorobanServer.sendTransaction(tx);
-  if (uploadResult.status === 'ERROR') {
-    throw new Error(uploadResult.errorResultXdr || 'WASM upload failed');
-  }
-
-  // Wait for upload confirmation
-  let uploadHash = uploadResult.hash;
-  for (let i = 0; i < 15; i++) {
-    const txResult = await sorobanServer.getTransaction(uploadHash);
-    if (txResult.status === 'SUCCESS') break;
-    if (txResult.status === 'FAILED') throw new Error('WASM upload transaction failed');
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-  }
-
-  // Step 2: Instantiate contract
-  const createOp = StellarSdk.Operation.createContract({
-    wasmHash,
-  });
-
-  const createAccount = await server.loadAccount(deployerKeypair.publicKey()); // reload to get updated sequence
-  tx = new StellarSdk.TransactionBuilder(createAccount, {
-    fee: StellarSdk.BASE_FEE,
-    networkPassphrase,
-  })
-    .addOperation(createOp)
-    .setTimeout(60)
-    .build();
-
-  tx = await sorobanServer.prepareTransaction(tx);
-  tx.sign(deployerKeypair);
-
-  const createResult = await sorobanServer.sendTransaction(tx);
-  if (createResult.status === 'ERROR') {
-    throw new Error(createResult.errorResultXdr || 'Contract instantiation failed');
-  }
-
-  // Wait for instantiation confirmation
-  let createHash = createResult.hash;
-  for (let i = 0; i < 15; i++) {
-    const txResult = await sorobanServer.getTransaction(createHash);
-    if (txResult.status === 'SUCCESS') {
-      const contractId = txResult.resultMetaXdr?.v3()?.sorobanMeta()?.events()?.[0]?.contractEvent()?.contractId()?.contractId()?.toString('hex');
-      if (contractId) {
-        return {
-          contractId: StellarSdk.StrKey.encodeContract(StellarSdk.xdr.ScAddressType.scAddressTypeContract().value, Buffer.from(contractId, 'hex')),
-          wasmHash: wasmHash.toString('hex'),
-          txHash: createHash,
-        };
-      }
-      break;
-    }
-    if (txResult.status === 'FAILED') throw new Error('Contract instantiation transaction failed');
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-  }
-
-  throw new Error('Failed to extract contract ID from transaction result');
-}
-
 module.exports = {
   isTestnet,
   server,
   createWallet,
+  createWalletFromMnemonic,
+  deriveKeypairFromMnemonic,
   fundTestnetAccount,
   getBalance,
+  getAllBalances,
   sendPayment,
+  wrapWithFeeBump,
+  pathPayment,
+  getPathPaymentEstimate,
+  getPlatformFeeInfo,
   getTransactions,
-  generatePaymentLink,
+  lookupFederationAddress,
+  addTrustline,
+  removeTrustline,
+  mergeAccount,
+  createClaimableBalance,
+  createPreorderClaimableBalance,
+  claimBalance,
+  invokeEscrowContract,
+  getContractState,
+  getContractWasmHash,
+  simulateContractCall,
+  getContractEvents,
+  getContractABI,
+  analyzeContractFees,
+  resolveFederationAddress,
+  mintRewardTokens,
+  recordCarbonOffset,
+  getCarbonOffset,
 };
+// Backward-compatible barrel — all callers continue to require('./utils/stellar').
+// Internals are split into domain modules for maintainability.
+const config = require('./stellar-config');
+const accounts = require('./stellar-accounts');
+const payments = require('./stellar-payments');
+const contracts = require('./stellar-contracts');
 
-/**
- * General purpose Soroban contract invocation (state-changing).
- */
-async function invokeContract({ contractId, method, args = [], signerSecret }) {
-  const keypair = StellarSdk.Keypair.fromSecret(signerSecret);
-  const source = await server.loadAccount(keypair.publicKey());
-  const contract = new StellarSdk.Contract(contractId);
-
-  const scArgs = args.map(arg => StellarSdk.nativeToScVal(arg.value, { type: arg.type }));
-  let operation = contract.call(method, ...scArgs);
-
-  let tx = new StellarSdk.TransactionBuilder(source, {
-    fee: StellarSdk.BASE_FEE,
-    networkPassphrase,
-  })
-    .addOperation(operation)
-    .setTimeout(60)
-    .build();
-
-  tx = await sorobanServer.prepareTransaction(tx);
-  tx.sign(keypair);
-
-  const sendResult = await sorobanServer.sendTransaction(tx);
-  if (sendResult.status === 'ERROR') {
-    throw new Error(`Soroban RPC Error: ${sendResult.errorResultXdr}`);
-  }
-
-  const hash = sendResult.hash;
-  for (let i = 0; i < 10; i++) {
-    const txResult = await sorobanServer.getTransaction(hash);
-    if (txResult.status === 'SUCCESS') return { hash, result: txResult.returnValue };
-    if (txResult.status === 'FAILED') throw new Error('Soroban transaction failed');
-    await new Promise(r => setTimeout(r, 2000));
-  }
-  throw new Error('Transaction confirmation timeout');
-}
-
-/**
- * General purpose Soroban simulation (read-only).
- */
-async function simulateContract({ contractId, method, args = [] }) {
-  const sourcePublic = process.env.PLATFORM_WALLET_PUBLIC_KEY;
-  const account = await server.loadAccount(sourcePublic);
-  const contract = new StellarSdk.Contract(contractId);
-  const scArgs = args.map(arg => StellarSdk.nativeToScVal(arg.value, { type: arg.type }));
-  
-  const tx = new StellarSdk.TransactionBuilder(account, {
-    fee: StellarSdk.BASE_FEE,
-    networkPassphrase,
-  })
-    .addOperation(contract.call(method, ...scArgs))
-    .setTimeout(60)
-    .build();
-
-  const sim = await sorobanServer.simulateTransaction(tx);
-  if (StellarSdk.rpc.Api.isSimulationError(sim)) {
-    throw new Error(`Simulation failed: ${JSON.stringify(sim.error)}`);
-  }
-  return sim;
-}
-
-/**
- * Fetch the memo text from a Stellar transaction by hash.
- * Returns the memo string, or null if none / on error.
- */
-async function getMemo(txHash) {
-  if (!txHash) return null;
-  try {
-    const tx = await server.transactions().transaction(txHash).call();
-    if (tx.memo_type === 'text' && tx.memo) return tx.memo;
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-module.exports = {
-  ...module.exports,
-  invokeContract,
-  simulateContract,
-  getMemo,
-};
-
-// .
+module.exports = { ...config, ...accounts, ...payments, ...contracts };

@@ -10,13 +10,16 @@ const STELLAR_ERROR_MAP = [
 ];
 
 const STELLAR_ERROR_CODE_MAP = {
+  tx_bad_seq: 'Invalid transaction sequence number. Please try again.',
+  tx_insufficient_fee: 'The transaction fee is insufficient. Please increase the fee and retry.',
+  tx_no_account: 'The source account does not exist. Please fund your wallet first.',
+  tx_failed: 'Transaction failed on the Stellar network. Please check your balance and try again.',
   op_underfunded: 'The account does not have enough funds to perform this operation.',
   op_src_not_authorized: 'The source account is not authorized to perform this operation.',
   op_no_destination: 'The destination account does not exist.',
-  op_no_trust: 'The account does not have a trustline for this asset.',
+  op_no_trust: 'The account does not have a trustline for this asset. Please add the trustline first.',
+  op_low_reserve: 'The account does not have enough balance to maintain the minimum reserve. Please fund your account.',
   op_line_full: 'The trustline limit has been reached.',
-  tx_bad_seq: 'Invalid transaction sequence number.',
-  tx_insufficient_fee: 'The transaction fee is insufficient.',
 };
 
 export function getStellarErrorMessage(err) {

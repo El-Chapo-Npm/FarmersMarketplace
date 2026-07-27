@@ -1,6 +1,7 @@
 const router = require('express').Router();
 const db = require('../db/schema');
 const auth = require('../middleware/auth');
+const requireEmailVerified = require('../middleware/requireEmailVerified');
 const cache = require('../cache');
 const validate = require('../middleware/validate');
 const upload = require('../middleware/upload');
@@ -9,6 +10,8 @@ const { sanitizeText } = require('../utils/sanitize');
 const { rewriteImageUrl } = require('../utils/cdn');
 const { sendBackInStockEmail } = require('../utils/mailer');
 const AutomaticOrderProcessor = require('../services/AutomaticOrderProcessor');
+const logger = require('../logger');
+
 
 const VALID_ALLERGENS = ['gluten', 'nuts', 'dairy', 'eggs', 'soy', 'shellfish'];
 
@@ -55,7 +58,7 @@ router.get('/', async (req, res) => {
   const page = Math.max(1, parseInt(req.query.page, 10) || 1);
   const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
   const offset = (page - 1) * limit;
-  const { category, minPrice, maxPrice, seller, available = 'true', lat, lng, radius, grade } = req.query;
+  const { category, minPrice, maxPrice, seller, available = 'true', lat, lng, radius, grade, q } = req.query;
 
   const conditions = [];
   const params = [];
@@ -76,6 +79,22 @@ router.get('/', async (req, res) => {
   if (grade) {
     const VALID_GRADES = ['A', 'B', 'C', 'Ungraded'];
     if (VALID_GRADES.includes(grade)) { conditions.push(`p.grade = $${params.length + 1}`); params.push(grade); }
+  }
+
+  // Full-text search: PostgreSQL uses tsvector/GIN; SQLite falls back to LIKE
+  let tsRankSelect = '';
+  let tsOrderBy = null;
+  if (q && q.trim()) {
+    if (db.isPostgres) {
+      conditions.push(`p.search_vector @@ plainto_tsquery('english', $${params.length + 1})`);
+      params.push(q.trim());
+      tsRankSelect = `, ts_rank(p.search_vector, plainto_tsquery('english', $${params.length})) as _ts_rank`;
+      tsOrderBy = '_ts_rank DESC';
+    } else {
+      const likeQ = `%${q.trim()}%`;
+      conditions.push(`(p.name LIKE $${params.length + 1} OR p.description LIKE $${params.length + 2})`);
+      params.push(likeQ, likeQ);
+    }
   }
 
   const filterLat = parseFloat(lat);
@@ -99,16 +118,17 @@ router.get('/', async (req, res) => {
 
   const VALID_SORTS = { price_asc: 'p.price ASC', price_desc: 'p.price DESC', newest: 'p.created_at DESC', popular: 'order_count DESC' };
   const sortKey = VALID_SORTS[req.query.sort] ? req.query.sort : 'newest';
-  const orderBy = VALID_SORTS[sortKey];
-  const popularJoin = sortKey === 'popular'
+  // Text search results ordered by relevance rank; other sorts apply normally
+  const orderBy = tsOrderBy || VALID_SORTS[sortKey];
+  const popularJoin = sortKey === 'popular' && !tsOrderBy
     ? `LEFT JOIN (SELECT product_id, COUNT(*) as order_count FROM orders WHERE status='paid' GROUP BY product_id) oc ON oc.product_id = p.id`
     : '';
-  const popularSelect = sortKey === 'popular' ? ', COALESCE(oc.order_count, 0) as order_count' : '';
+  const popularSelect = sortKey === 'popular' && !tsOrderBy ? ', COALESCE(oc.order_count, 0) as order_count' : '';
 
   const { rows: products } = await db.query(
     `SELECT p.*, u.name as farmer_name, u.latitude as farmer_lat, u.longitude as farmer_lng, u.farm_address as farmer_farm_address,
             ROUND(AVG(r.rating)${db.isPostgres ? '::numeric' : ''}, 1) as avg_rating,
-            COUNT(r.id) as review_count${popularSelect}
+            COUNT(r.id) as review_count${popularSelect}${tsRankSelect}
      FROM products p
      JOIN users u ON p.farmer_id = u.id
      LEFT JOIN reviews r ON r.product_id = p.id
@@ -135,54 +155,32 @@ router.get('/', async (req, res) => {
   res.json(payload);
 });
 
-// GET /api/products/search
-router.get('/search', async (req, res) => {
-  const q = (req.query.q || '').trim();
-  if (!q) {
-    const { rows } = await db.query(
-      `SELECT p.*, u.name as farmer_name FROM products p JOIN users u ON p.farmer_id = u.id ORDER BY p.created_at DESC LIMIT 100`
-    );
-    return res.json({ success: true, data: rows });
+// GET /api/products/allergens — returns the canonical allergen whitelist
+router.get('/allergens', (req, res) => {
+  res.json({ success: true, allergens: VALID_ALLERGENS });
+});
+
+// GET /api/products/:id
+router.get('/:id', (req, res) => {
+  const product = db.prepare(`
+    SELECT p.*, u.name AS farmer_name, u.stellar_public_key AS farmer_wallet
+    FROM products p
+    JOIN users u ON p.farmer_id = u.id
+    WHERE p.id = ?
+  `).get(req.params.id);
+  if (!product) return res.status(404).json({ error: 'Product not found' });
+
+  // #616 — hide product if not yet available per scheduling
+  const schedule = db.prepare('SELECT available_from FROM product_scheduling WHERE product_id = ?')
+    .get(product.id);
+  if (schedule && new Date(schedule.available_from) > new Date()) {
+    return res.status(404).json({
+      error: 'Product not yet available',
+      available_from: schedule.available_from,
+    });
   }
-  const like = `%${q}%`;
-  const { rows } = await db.query(
-    `SELECT p.*, u.name as farmer_name FROM products p JOIN users u ON p.farmer_id = u.id
-     WHERE p.name ${db.isPostgres ? 'ILIKE' : 'LIKE'} $1 OR p.description ${db.isPostgres ? 'ILIKE' : 'LIKE'} $2
-     ORDER BY p.created_at DESC LIMIT 100`,
-    [like, like]
-  );
-  res.json({ success: true, data: rows });
-});
 
-// GET /api/products/categories
-router.get('/categories', async (_req, res) => {
-  const { rows } = await db.query(
-    'SELECT DISTINCT category FROM products WHERE category IS NOT NULL ORDER BY category'
-  );
-  res.json({ success: true, data: rows.map((r) => r.category) });
-});
-
-// GET /api/products/mine/list
-router.get('/mine/list', auth, async (req, res) => {
-  if (req.user.role !== 'farmer') return err(res, 403, 'Farmers only', 'forbidden');
-  const { rows } = await db.query(
-    'SELECT * FROM products WHERE farmer_id = $1 ORDER BY created_at DESC',
-    [req.user.id]
-  );
-  res.json({ success: true, data: rows });
-});
-
-// POST /api/products/upload-image
-router.post('/upload-image', auth, (req, res) => {
-  if (req.user.role !== 'farmer') return err(res, 403, 'Only farmers can upload images', 'forbidden');
-  upload.single('image')(req, res, (uploadErr) => {
-    if (uploadErr) {
-      if (uploadErr.code === 'LIMIT_FILE_SIZE') return err(res, 400, 'Image must be 5 MB or smaller', 'file_too_large');
-      return err(res, 400, 'Upload failed', 'upload_error');
-    }
-    if (!req.file) return err(res, 400, 'No image file provided', 'no_file');
-    res.json({ success: true, imageUrl: `/uploads/${req.file.filename}` });
-  });
+  res.json(product);
 });
 
 /**
@@ -220,7 +218,7 @@ router.post('/upload-image', auth, (req, res) => {
  *     tags: [Products]
  */
 // POST /api/products
-router.post('/', auth, validate.product, async (req, res) => {
+router.post('/', auth, requireEmailVerified, validate.product, async (req, res) => {
   if (req.user.role !== 'farmer') return err(res, 403, 'Only farmers can list products', 'forbidden');
 
   const { name, description, unit, category, image_url, nutrition } = req.body;
@@ -234,173 +232,132 @@ router.post('/', auth, validate.product, async (req, res) => {
   const preorder = normalizePreorderInput(req.body);
   if (preorder.error) return err(res, 400, preorder.error, 'validation_error');
 
-  const allergenResult = parseAndValidateAllergens(req.body.allergens);
-  if (allergenResult.error) return err(res, 400, allergenResult.error, 'validation_error');
+  const { weight_kg, available_from, available_until } = req.body;
 
-  const safeName        = sanitizeText(name);
-  const safeDescription = sanitizeText(description || '');
-  const safeUnit        = sanitizeText(unit || 'unit');
-  const safeCategory    = sanitizeText(category || 'other');
-  const safeImageUrl    = image_url && /^\/uploads\/[a-f0-9]+\.(jpg|jpeg|png|webp)$/i.test(image_url) ? image_url : null;
+  if (available_until != null) {
+    if (new Date(available_until) <= new Date()) return err(res, 400, 'available_until must be in the future', 'validation_error');
+  }
+  if (available_from != null && available_until != null) {
+    if (new Date(available_from) >= new Date(available_until)) return err(res, 400, 'available_from must be before available_until', 'validation_error');
+  }
 
-  const pricingType = req.body.pricing_type === 'weight' ? 'weight' : 'unit';
-  const minWeight   = pricingType === 'weight' ? parseFloat(req.body.min_weight) : null;
-  const maxWeight   = pricingType === 'weight' ? parseFloat(req.body.max_weight) : null;
+  const result = db.prepare(
+    'INSERT INTO products (farmer_id, name, description, price, quantity, unit, weight_kg) VALUES (?, ?, ?, ?, ?, ?, ?)'
+  ).run(
+    req.user.id, name, description || '', price, quantity,
+    unit || 'unit', weight_kg != null ? weight_kg : 1.0
+  );
 
-  let batchId = null;
-  if (req.body.batch_id !== undefined && req.body.batch_id !== null && req.body.batch_id !== '') {
-    batchId = parseInt(req.body.batch_id, 10);
-    if (Number.isNaN(batchId) || batchId < 1) return err(res, 400, 'batch_id must be a positive integer', 'validation_error');
-    const { rows: bRows } = await db.query(
-      'SELECT id FROM harvest_batches WHERE id = $1 AND farmer_id = $2',
-      [batchId, req.user.id]
+  const productId = result.lastInsertRowid;
+
+  if (available_from) {
+    db.prepare('INSERT INTO product_scheduling (product_id, available_from) VALUES (?, ?)').run(
+      productId, available_from
     );
-    if (!bRows[0]) return err(res, 400, 'Invalid batch_id or not your batch', 'invalid_batch');
   }
 
-  const { rows } = await db.query(
-    `INSERT INTO products (farmer_id, name, description, category, price, quantity, unit, image_url,
-      low_stock_threshold, nutrition, pricing_type, min_weight, max_weight, batch_id,
-      is_preorder, preorder_delivery_date, allergens, allowed_regions, available_from, available_until)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20) RETURNING id`,
-    [
-      req.user.id, safeName, safeDescription, safeCategory, price, quantity, safeUnit, safeImageUrl,
-      parseInt(req.body.low_stock_threshold, 10) || 5, nutrition ? JSON.stringify(nutrition) : null,
-      pricingType, minWeight, maxWeight, batchId,
-      preorder.isPreorder ? 1 : 0, preorder.preorderDeliveryDate,
-      allergenResult.allergens, parseAllowedRegions(req.body.allowed_regions),
-      req.body.available_from || null, req.body.available_until || null,
-    ]
-  );
-  const productId = rows[0].id;
-  await db.query('INSERT INTO price_history (product_id, price) VALUES ($1, $2)', [productId, price]);
-  await cache.del('products:{}');
-  res.json({ success: true, id: productId, message: 'Product listed' });
+  await cache.delByPattern('products:*');
+  res.json({ id: productId, message: 'Product listed' });
 });
 
-/**
- * @swagger
- * /api/products/{id}:
- *   patch:
- *     summary: Update a product listing (farmer only)
- *     tags: [Products]
- *     security:
- *       - bearerAuth: []
- *     parameters:
- *       - in: path
- *         name: id
- *         required: true
- *         schema: { type: integer }
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             properties:
- *               name: { type: string }
- *               description: { type: string }
- *               price: { type: number, description: Price in XLM, must be positive }
- *               quantity:
- *                 type: integer
- *                 minimum: 0
- *                 description: >
- *                   Stock quantity. Must be a non-negative integer.
- *                   Setting quantity to 0 hides the product from public listings
- *                   (GET /api/products) but the product remains visible to the
- *                   farmer via GET /api/products/mine/list.
- *               unit: { type: string }
- *               category: { type: string }
- *               low_stock_threshold: { type: integer, minimum: 0 }
- *     responses:
- *       200:
- *         description: Product updated
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 success: { type: boolean }
- *                 message: { type: string }
- *       400:
- *         description: Validation error
- *         content:
- *           application/json:
- *             schema: { $ref: '#/components/schemas/Error' }
- *       403:
- *         description: Only farmers can edit products
- *         content:
- *           application/json:
- *             schema: { $ref: '#/components/schemas/Error' }
- *       404:
- *         description: Not found or not yours
- *         content:
- *           application/json:
- *             schema: { $ref: '#/components/schemas/Error' }
- */
-// PATCH /api/products/bulk-price
-router.patch('/bulk-price', auth, async (req, res) => {
-  if (req.user.role !== 'farmer') return err(res, 403, 'Farmers only', 'forbidden');
+// PUT /api/products/:id/schedule - farmer sets or updates pre-order availability
+router.put('/:id/schedule', auth, (req, res) => {
+  if (req.user.role !== 'farmer')
+    return res.status(403).json({ error: 'Only farmers can schedule products' });
 
-  const { updates, adjustment_percent } = req.body;
-  if (!Array.isArray(updates) || updates.length === 0) {
-    return err(res, 400, 'updates must be a non-empty array of { id, price }', 'validation_error');
-  }
-  for (let i = 0; i < updates.length; i++) {
-    const u = updates[i];
-    if (!u.id || typeof u.id !== 'number') return err(res, 400, `updates[${i}].id must be a number`, 'validation_error');
-    if (adjustment_percent == null && (typeof u.price !== 'number' || u.price <= 0)) {
-      return err(res, 400, `updates[${i}].price must be a positive number`, 'validation_error');
-    }
-  }
-  if (adjustment_percent != null && typeof adjustment_percent !== 'number') {
-    return err(res, 400, 'adjustment_percent must be a number', 'validation_error');
-  }
+  const product = db.prepare('SELECT id FROM products WHERE id = ? AND farmer_id = ?')
+    .get(req.params.id, req.user.id);
+  if (!product) return res.status(404).json({ error: 'Product not found or not yours' });
 
-  const ids = updates.map((u) => u.id);
-  const placeholders = ids.map((_, i) => `$${i + 2}`).join(', ');
-  const { rows: owned } = await db.query(
-    `SELECT id, price FROM products WHERE farmer_id = $1 AND id IN (${placeholders})`,
-    [req.user.id, ...ids]
-  );
-  const ownedIds = new Set(owned.map((r) => Number(r.id)));
+  const { available_from } = req.body;
+  if (!available_from)
+    return res.status(400).json({ error: 'available_from required (ISO 8601 datetime)' });
 
-  const updated = [];
-  const failed = [];
-  for (const u of updates) {
-    if (!ownedIds.has(u.id)) { failed.push({ id: u.id, reason: 'Not found or not owned by you' }); continue; }
-    let newPrice = adjustment_percent != null
-      ? parseFloat((owned.find((r) => Number(r.id) === u.id).price * (1 + adjustment_percent / 100)).toFixed(7))
-      : u.price;
-    if (newPrice <= 0) { failed.push({ id: u.id, reason: 'Computed price must be positive' }); continue; }
-    await db.query('UPDATE products SET price = $1 WHERE id = $2', [newPrice, u.id]);
-    updated.push({ id: u.id, price: newPrice });
-  }
-  res.json({ success: true, data: { updated, failed } });
+  db.prepare(`
+    INSERT INTO product_scheduling (product_id, available_from)
+    VALUES (?, ?)
+    ON CONFLICT(product_id) DO UPDATE SET available_from = excluded.available_from
+  `).run(req.params.id, available_from);
+
+  res.json({ message: 'Schedule updated', product_id: req.params.id, available_from });
 });
 
-// GET /api/products/:id
-router.get('/:id', async (req, res) => {
-  const { rows } = await db.query(
-    `SELECT p.*, u.name as farmer_name, u.bio as farmer_bio, u.location as farmer_location,
-            u.avatar_url as farmer_avatar, u.stellar_public_key as farmer_wallet,
-            hb.batch_code as harvest_batch_code, hb.harvest_date as harvest_batch_date, hb.notes as harvest_batch_notes,
-            ROUND(AVG(r.rating)${db.isPostgres ? '::numeric' : ''}, 1) as avg_rating,
-            COUNT(r.id) as review_count
-     FROM products p
-     JOIN users u ON p.farmer_id = u.id
-     LEFT JOIN reviews r ON r.product_id = p.id
-     LEFT JOIN harvest_batches hb ON hb.id = p.batch_id
-     WHERE p.id = $1
-     GROUP BY p.id, u.name, u.bio, u.location, u.avatar_url, u.stellar_public_key,
-              hb.batch_code, hb.harvest_date, hb.notes`,
-    [req.params.id]
-  );
-  if (!rows[0]) return err(res, 404, 'Product not found', 'not_found');
-  const product = rows[0];
-  product.image_url = rewriteImageUrl(product.image_url);
-  product.farmer_avatar = rewriteImageUrl(product.farmer_avatar);
-  res.json({ success: true, data: product });
+// DELETE /api/products/:id/schedule - farmer removes scheduling (makes immediately available)
+router.delete('/:id/schedule', auth, (req, res) => {
+  if (req.user.role !== 'farmer')
+    return res.status(403).json({ error: 'Farmers only' });
+
+  const product = db.prepare('SELECT id FROM products WHERE id = ? AND farmer_id = ?')
+    .get(req.params.id, req.user.id);
+  if (!product) return res.status(404).json({ error: 'Product not found or not yours' });
+
+  db.prepare('DELETE FROM product_scheduling WHERE product_id = ?').run(req.params.id);
+  res.json({ message: 'Schedule removed, product is now immediately available' });
+});
+
+// GET /api/products/mine/list - farmer's own products (includes unscheduled ones)
+router.get('/mine/list', auth, (req, res) => {
+  if (req.user.role !== 'farmer')
+    return res.status(403).json({ error: 'Farmers only' });
+
+  const products = db.prepare(`
+    SELECT p.*, ps.available_from
+    FROM products p
+    LEFT JOIN product_scheduling ps ON p.id = ps.product_id
+    WHERE p.farmer_id = ?
+    ORDER BY p.created_at DESC
+  `).all(req.user.id);
+  res.json(products);
+});
+
+// PUT /api/products/:id/schedule - farmer sets or updates pre-order availability
+router.put('/:id/schedule', auth, (req, res) => {
+  if (req.user.role !== 'farmer')
+    return res.status(403).json({ error: 'Only farmers can schedule products' });
+
+  const product = db.prepare('SELECT id FROM products WHERE id = ? AND farmer_id = ?')
+    .get(req.params.id, req.user.id);
+  if (!product) return res.status(404).json({ error: 'Product not found or not yours' });
+
+  const { available_from } = req.body;
+  if (!available_from)
+    return res.status(400).json({ error: 'available_from required (ISO 8601 datetime)' });
+
+  db.prepare(`
+    INSERT INTO product_scheduling (product_id, available_from)
+    VALUES (?, ?)
+    ON CONFLICT(product_id) DO UPDATE SET available_from = excluded.available_from
+  `).run(req.params.id, available_from);
+
+  res.json({ message: 'Schedule updated', product_id: req.params.id, available_from });
+});
+
+// DELETE /api/products/:id/schedule - farmer removes scheduling (makes immediately available)
+router.delete('/:id/schedule', auth, (req, res) => {
+  if (req.user.role !== 'farmer')
+    return res.status(403).json({ error: 'Farmers only' });
+
+  const product = db.prepare('SELECT id FROM products WHERE id = ? AND farmer_id = ?')
+    .get(req.params.id, req.user.id);
+  if (!product) return res.status(404).json({ error: 'Product not found or not yours' });
+
+  db.prepare('DELETE FROM product_scheduling WHERE product_id = ?').run(req.params.id);
+  res.json({ message: 'Schedule removed, product is now immediately available' });
+});
+
+// GET /api/products/mine/list - farmer's own products (includes unscheduled ones)
+router.get('/mine/list', auth, (req, res) => {
+  if (req.user.role !== 'farmer')
+    return res.status(403).json({ error: 'Farmers only' });
+
+  const products = db.prepare(`
+    SELECT p.*, ps.available_from
+    FROM products p
+    LEFT JOIN product_scheduling ps ON p.id = ps.product_id
+    WHERE p.farmer_id = ?
+    ORDER BY p.created_at DESC
+  `).all(req.user.id);
+  res.json(products);
 });
 
 // PATCH /api/products/:id
@@ -418,7 +375,7 @@ router.patch('/:id', auth, async (req, res) => {
     'name', 'description', 'price', 'quantity', 'unit', 'category',
     'low_stock_threshold', 'nutrition', 'pricing_type', 'min_weight', 'max_weight',
     'batch_id', 'is_preorder', 'preorder_delivery_date', 'allergens', 'allowed_regions',
-    'grade', 'carbon_kg_per_unit', 'available_from', 'available_until',
+    'grade', 'carbon_kg_per_unit', 'available_from', 'available_until', 'best_before',
   ];
   const updates = {};
   for (const key of allowed) {
@@ -449,7 +406,7 @@ router.patch('/:id', auth, async (req, res) => {
   }
   if (updates.allergens !== undefined) {
     const allergenResult = parseAndValidateAllergens(updates.allergens);
-    if (allergenResult.error) return err(res, 400, allergenResult.error, 'validation_error');
+    if (allergenResult.error) return err(res, 400, allergenResult.error, 'invalid_allergen');
     updates.allergens = allergenResult.allergens;
   }
   if (updates.allowed_regions !== undefined) {
@@ -458,6 +415,16 @@ router.patch('/:id', auth, async (req, res) => {
   if (updates.grade !== undefined) {
     const VALID_GRADES = ['A', 'B', 'C', 'Ungraded'];
     if (!VALID_GRADES.includes(updates.grade)) return err(res, 400, 'grade must be A, B, C, or Ungraded', 'validation_error');
+  }
+  if (updates.best_before !== undefined) {
+    if (updates.best_before !== null && !/^\d{4}-\d{2}-\d{2}$/.test(updates.best_before)) {
+      return err(res, 400, 'best_before must be YYYY-MM-DD or null', 'validation_error');
+    }
+    const currentBestBefore = product.best_before ? String(product.best_before).split('T')[0] : null;
+    const today = new Date().toISOString().split('T')[0];
+    if (updates.best_before !== currentBestBefore && updates.best_before && updates.best_before > today) {
+      updates.expiry_notified_at = null;
+    }
   }
   if (updates.batch_id !== undefined) {
     if (updates.batch_id === null || updates.batch_id === '') {
@@ -469,6 +436,15 @@ router.patch('/:id', auth, async (req, res) => {
       if (!bRows[0]) return err(res, 400, 'Invalid batch_id or not your batch', 'invalid_batch');
       updates.batch_id = bid;
     }
+  }
+
+  if (updates.available_until != null) {
+    if (new Date(updates.available_until) <= new Date()) return err(res, 400, 'available_until must be in the future', 'validation_error');
+  }
+  const patchFrom = updates.available_from != null ? updates.available_from : product.available_from;
+  const patchUntil = updates.available_until !== undefined ? updates.available_until : product.available_until;
+  if (patchFrom != null && patchUntil != null) {
+    if (new Date(patchFrom) >= new Date(patchUntil)) return err(res, 400, 'available_from must be before available_until', 'validation_error');
   }
 
   const nextIsPreorder = updates.is_preorder !== undefined
@@ -503,6 +479,7 @@ router.patch('/:id', auth, async (req, res) => {
     await db.query('INSERT INTO price_history (product_id, price) VALUES ($1, $2)', [req.params.id, updates.price]);
   }
 
+  await cache.delByPattern('products:*');
   res.json({ success: true, message: 'Product updated' });
 });
 
@@ -553,7 +530,7 @@ router.delete('/:id', auth, async (req, res) => {
     [req.params.id, req.user.id]
   );
   if (rowCount === 0) return err(res, 404, 'Not found or not yours', 'not_found');
-  await cache.del('products:{}');
+  await cache.delByPattern('products:*');
   res.json({ success: true, message: 'Deleted' });
 });
 
@@ -679,6 +656,16 @@ router.post('/:id/images', auth, async (req, res) => {
   });
 });
 
+// GET /api/products/:id
+router.get('/:id', (req, res) => {
+  const product = db.prepare(`
+    SELECT p.*, u.name as farmer_name, u.stellar_public_key as farmer_wallet,
+           COALESCE(p.avg_rating, 0) as avg_rating,
+           COALESCE(p.review_count, 0) as review_count
+    FROM products p JOIN users u ON p.farmer_id = u.id WHERE p.id = ?
+  `).get(req.params.id);
+  if (!product) return err(res, 404, 'Product not found', 'not_found');
+  res.json({ success: true, data: product });
 // DELETE /api/products/:id/images/:imgId
 router.delete('/:id/images/:imgId', auth, async (req, res) => {
   if (req.user.role !== 'farmer') return err(res, 403, 'Only farmers can delete images', 'forbidden');
@@ -774,12 +761,14 @@ router.post('/:id/tiers', auth, async (req, res) => {
   const { tiers } = req.body;
   if (!Array.isArray(tiers)) return err(res, 400, 'tiers must be an array', 'validation_error');
 
-  const sortedTiers = tiers.sort((a, b) => a.min_quantity - b.min_quantity);
+  const sortedTiers = [...tiers].sort((a, b) => a.min_quantity - b.min_quantity);
   for (let i = 0; i < sortedTiers.length; i++) {
     const tier = sortedTiers[i];
     if (!tier.min_quantity || tier.min_quantity < 1 || !Number.isInteger(tier.min_quantity)) return err(res, 400, 'min_quantity must be a positive integer', 'validation_error');
     if (!tier.price_per_unit || tier.price_per_unit <= 0) return err(res, 400, 'price_per_unit must be a positive number', 'validation_error');
-    if (i > 0 && tier.min_quantity <= sortedTiers[i - 1].min_quantity) return err(res, 400, 'min_quantity values must be increasing', 'validation_error');
+    if (i > 0 && tier.min_quantity <= sortedTiers[i - 1].min_quantity) return err(res, 409, 'Overlapping tier ranges detected', 'tier_overlap');
+    // Volume discount: each successive tier must have a lower or equal price
+    if (i > 0 && tier.price_per_unit > sortedTiers[i - 1].price_per_unit) return err(res, 400, 'price_per_unit must be <= the price of the previous tier (volume discount required)', 'validation_error');
   }
 
   await db.query('DELETE FROM price_tiers WHERE product_id = $1', [req.params.id]);
@@ -792,6 +781,35 @@ router.post('/:id/tiers', auth, async (req, res) => {
     [req.params.id]
   );
   res.json({ success: true, data: newTiers });
+});
+
+// DELETE /api/products/:id/tiers/:tierId
+router.delete('/:id/tiers/:tierId', auth, async (req, res) => {
+  if (req.user.role !== 'farmer') return err(res, 403, 'Only farmers can manage price tiers', 'forbidden');
+  const { rows: prodRows } = await db.query('SELECT * FROM products WHERE id = $1 AND farmer_id = $2', [req.params.id, req.user.id]);
+  if (!prodRows[0]) return err(res, 404, 'Product not found or not yours', 'not_found');
+
+  const { rows: tierRows } = await db.query('SELECT * FROM price_tiers WHERE id = $1 AND product_id = $2', [req.params.tierId, req.params.id]);
+  if (!tierRows[0]) return err(res, 404, 'Tier not found', 'not_found');
+
+  const deletedTier = tierRows[0];
+  await db.query('DELETE FROM price_tiers WHERE id = $1', [req.params.tierId]);
+
+  // Recalculate active subscriptions that used this tier's quantity bracket
+  // Set their next price to be recalculated at next order time by clearing any cached price
+  // (subscriptions use live getTierPrice at order time, so deleting the tier is sufficient;
+  //  but we log affected subscriptions for visibility)
+  const { rows: affected } = await db.query(
+    'SELECT id FROM subscriptions WHERE product_id = $1 AND quantity >= $2 AND active = 1',
+    [req.params.id, deletedTier.min_quantity]
+  );
+  if (affected.length > 0) {
+    logger.info('[tiers] Deleted tier may affect subscriptions; prices will recalculate at next order', {
+      tierId: req.params.tierId, productId: req.params.id, affectedSubscriptions: affected.length,
+    });
+  }
+
+  res.json({ success: true });
 });
 
 // GET /api/products/:id/price-history
@@ -849,6 +867,126 @@ router.get('/:id/stock-stream', async (req, res) => {
       if (clients.size === 0) stockClients.delete(productId);
     }
   });
+});
+
+/**
+ * @swagger
+ * /api/products/{id}/batches:
+ *   get:
+ *     summary: Get harvest batch traceability details for a product
+ *     tags: [Products]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: integer }
+ *         description: Product ID
+ *     responses:
+ *       200:
+ *         description: Harvest batch details for the product
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success: { type: boolean, example: true }
+ *                 data:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                     properties:
+ *                       id: { type: integer }
+ *                       batch_code: { type: string }
+ *                       harvest_date: { type: string, format: date }
+ *                       location: { type: string, nullable: true }
+ *                       certifications: { type: string, nullable: true }
+ *                       notes: { type: string, nullable: true }
+ *                       created_at: { type: string, format: date-time }
+ *       404:
+ *         description: Product not found
+ *         content:
+ *           application/json:
+ *             schema: { $ref: '#/components/schemas/Error' }
+ */
+// GET /api/products/:id/batches — public traceability endpoint
+router.get('/:id/batches', async (req, res) => {
+  const productId = parseInt(req.params.id, 10);
+  if (!productId || productId < 1) return res.status(400).json({ success: false, error: 'Invalid product id', code: 'validation_error' });
+
+  const { rows: prodRows } = await db.query(
+    'SELECT batch_id FROM products WHERE id = $1',
+    [productId],
+  );
+  if (!prodRows[0]) return res.status(404).json({ success: false, error: 'Product not found', code: 'not_found' });
+
+  if (!prodRows[0].batch_id) {
+    return res.json({ success: true, data: [] });
+  }
+
+  const { rows } = await db.query(
+    `SELECT id, batch_code, harvest_date, location, certifications, notes, created_at
+     FROM harvest_batches WHERE id = $1`,
+    [prodRows[0].batch_id],
+  );
+  res.json({ success: true, data: rows });
+});
+
+// POST /api/products/:id/restock — farmer adds stock; triggers back-in-stock notifications (once per restock)
+router.post('/:id/restock', auth, (req, res) => {
+  if (req.user.role !== 'farmer') return res.status(403).json({ error: 'Farmers only' });
+
+  const quantity = parseInt(req.body.quantity, 10);
+  if (isNaN(quantity) || quantity < 1) return res.status(400).json({ error: 'quantity must be a positive integer' });
+
+  const product = db.prepare('SELECT * FROM products WHERE id = ? AND farmer_id = ?').get(req.params.id, req.user.id);
+  if (!product) return res.status(404).json({ error: 'Not found or not yours' });
+
+  const wasOutOfStock = product.quantity === 0;
+  db.prepare('UPDATE products SET quantity = quantity + ? WHERE id = ?').run(quantity, product.id);
+
+  // Only notify if the product was out of stock and hasn't fired a notification for this restock yet.
+  if (!wasOutOfStock || product.restock_notified_at) {
+    return res.json({ message: 'Restocked', quantity: product.quantity + quantity });
+  }
+
+  // Stamp immediately to prevent duplicate sends on concurrent requests.
+  db.prepare('UPDATE products SET restock_notified_at = CURRENT_TIMESTAMP WHERE id = ?').run(product.id);
+
+  // Gather unique buyer IDs from both favourites and waitlists.
+  const buyerIds = [
+    ...db.prepare('SELECT user_id FROM favourites WHERE product_id = ?').all(product.id),
+    ...db.prepare('SELECT user_id FROM waitlists WHERE product_id = ?').all(product.id),
+  ]
+    .map(r => r.user_id)
+    .filter((v, i, a) => a.indexOf(v) === i);
+
+  if (buyerIds.length === 0) return res.json({ message: 'Restocked', notified: 0 });
+
+  const updatedProduct = { ...product, quantity: product.quantity + quantity };
+
+  // Fire-and-forget — don't block the HTTP response.
+  Promise.allSettled(
+    buyerIds.map(async (userId) => {
+      const user = db.prepare('SELECT id, name, email FROM users WHERE id = ?').get(userId);
+      if (!user) return;
+
+      const sub = db.prepare('SELECT subscription_json FROM push_subscriptions WHERE user_id = ?').get(userId);
+
+      await Promise.allSettled([
+        sendBackInStockEmail({ user, product: updatedProduct }),
+        sendPushToUser({
+          subscription: sub ? JSON.parse(sub.subscription_json) : null,
+          payload: {
+            title: 'Back in stock',
+            body: `${updatedProduct.name} is available again!`,
+            url: `/products/${updatedProduct.id}`,
+          },
+        }),
+      ]);
+    })
+  ).catch(err => console.error('Restock notification error:', err.message));
+
+  res.json({ message: 'Restocked', notified: buyerIds.length });
 });
 
 module.exports = router;

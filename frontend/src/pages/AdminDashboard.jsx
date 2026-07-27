@@ -36,6 +36,106 @@ function DeactivateModal({ user, onConfirm, onCancel }) {
   );
 }
 
+function BanModal({ user, onConfirm, onCancel, loading }) {
+  const confirmRef = useRef(null);
+  const [reason, setReason] = useState('');
+  useEffect(() => { confirmRef.current?.focus(); }, []);
+  function handleKeyDown(e) {
+    if (e.key === 'Escape') onCancel();
+  }
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="ban-modal-title"
+      onKeyDown={handleKeyDown}
+      style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }}
+    >
+      <div style={{ background: '#fff', borderRadius: 12, padding: 28, maxWidth: 400, width: '90%', boxShadow: '0 4px 24px #0003' }}>
+        <div id="ban-modal-title" style={{ fontWeight: 700, fontSize: 17, marginBottom: 10, color: '#333' }}>
+          Ban {user.name}?
+        </div>
+        <p style={{ fontSize: 14, color: '#555', marginBottom: 14 }}>
+          This user will be unable to access the platform.
+        </p>
+        <textarea
+          ref={confirmRef}
+          value={reason}
+          onChange={e => setReason(e.target.value)}
+          placeholder="Optional ban reason (visible to user)…"
+          style={{ width: '100%', padding: '8px 12px', border: '1px solid #ddd', borderRadius: 8, fontSize: 14, resize: 'vertical', minHeight: 60, boxSizing: 'border-box', marginBottom: 16 }}
+        />
+        <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
+          <button onClick={onCancel} disabled={loading} style={{ padding: '8px 18px', borderRadius: 8, border: '1px solid #ddd', background: '#fff', cursor: loading ? 'not-allowed' : 'pointer', fontWeight: 600, color: loading ? '#aaa' : '#333' }}>
+            Cancel
+          </button>
+          <button onClick={() => onConfirm(reason)} disabled={loading} style={{ padding: '8px 18px', borderRadius: 8, border: 'none', background: loading ? '#ccc' : '#c0392b', color: '#fff', cursor: loading ? 'not-allowed' : 'pointer', fontWeight: 600 }}>
+            {loading ? 'Banning…' : 'Ban User'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ResolveDisputeModal({ dispute, onConfirm, onCancel }) {
+  const confirmRef = useRef(null);
+  const [status, setStatus] = useState(dispute.status === 'open' ? 'under_review' : 'resolved');
+  const [resolution, setResolution] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  useEffect(() => { confirmRef.current?.focus(); }, []);
+  async function handleSubmit(e) {
+    e.preventDefault();
+    if (status === 'resolved' && !resolution.trim()) { setErr('Resolution note is required.'); return; }
+    setBusy(true);
+    setErr('');
+    try { await onConfirm(dispute.id, { status, resolution: resolution.trim() || undefined }); }
+    catch (e) { setErr(e.message); setBusy(false); }
+  }
+  const nextStatuses = dispute.status === 'open' ? ['under_review'] : dispute.status === 'under_review' ? ['resolved'] : [];
+  return (
+    <div role="dialog" aria-modal="true" aria-labelledby="resolve-modal-title"
+      onKeyDown={e => e.key === 'Escape' && onCancel()}
+      style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }}>
+      <div style={{ background: '#fff', borderRadius: 12, padding: 28, maxWidth: 460, width: '90%', boxShadow: '0 4px 24px #0003' }}>
+        <div id="resolve-modal-title" style={{ fontWeight: 700, fontSize: 17, marginBottom: 6, color: '#333' }}>
+          Update Dispute #{dispute.id}
+        </div>
+        <div style={{ fontSize: 13, color: '#666', marginBottom: 16 }}>
+          <strong>{dispute.product_name}</strong> · {dispute.buyer_name} · {Number(dispute.total_price).toFixed(2)} XLM
+        </div>
+        <div style={{ fontSize: 13, color: '#555', marginBottom: 16, background: '#f8f8f8', borderRadius: 8, padding: '10px 12px' }}>
+          <strong>Reason:</strong> {dispute.reason}
+        </div>
+        <form onSubmit={handleSubmit}>
+          <label style={{ display: 'block', fontSize: 13, color: '#555', marginBottom: 4 }}>New Status</label>
+          <select value={status} onChange={e => setStatus(e.target.value)}
+            style={{ width: '100%', padding: '8px 12px', border: '1px solid #ddd', borderRadius: 8, fontSize: 14, marginBottom: 14 }}>
+            {nextStatuses.map(s => <option key={s} value={s}>{s.replace('_', ' ')}</option>)}
+          </select>
+          {status === 'resolved' && (
+            <>
+              <label style={{ display: 'block', fontSize: 13, color: '#555', marginBottom: 4 }}>Resolution Note</label>
+              <textarea ref={confirmRef} required value={resolution} onChange={e => setResolution(e.target.value)}
+                placeholder="Describe the resolution (release/refund/other)…"
+                style={{ width: '100%', padding: '8px 12px', border: '1px solid #ddd', borderRadius: 8, fontSize: 14, resize: 'vertical', minHeight: 80, boxSizing: 'border-box', marginBottom: 14 }} />
+            </>
+          )}
+          {err && <div style={{ color: '#c0392b', fontSize: 13, marginBottom: 10 }}>{err}</div>}
+          <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
+            <button type="button" onClick={onCancel} style={{ padding: '8px 18px', borderRadius: 8, border: '1px solid #ddd', background: '#fff', cursor: 'pointer', fontWeight: 600 }}>Cancel</button>
+            <button type="submit" ref={status !== 'resolved' ? confirmRef : undefined} disabled={busy}
+              style={{ padding: '8px 18px', borderRadius: 8, border: 'none', background: busy ? '#ccc' : '#2d6a4f', color: '#fff', cursor: busy ? 'not-allowed' : 'pointer', fontWeight: 600 }}>
+              {busy ? 'Saving…' : 'Confirm'}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
 const s = {
   page: { maxWidth: 1000, margin: '0 auto', padding: 24 },
   title: { fontSize: 24, fontWeight: 700, color: '#2d6a4f', marginBottom: 24 },
@@ -70,10 +170,20 @@ export default function AdminDashboard() {
   const [orderPagination, setOrderPagination] = useState({ page: 1, pages: 1, total: 0 });
   const [error, setError] = useState('');
   const [deactivateTarget, setDeactivateTarget] = useState(null);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [roleFilter, setRoleFilter] = useState('');
+  const [verifiedFilter, setVerifiedFilter] = useState('');
+  const [bannedFilter, setBannedFilter] = useState('');
+  const [banModalData, setBanModalData] = useState(null);
+  const [banBusy, setBanBusy] = useState(false);
   const [contracts, setContracts] = useState([]);
   const [contractForm, setContractForm] = useState({ contract_id: '', name: '', type: 'escrow', network: 'testnet' });
   const [contractMsg, setContractMsg] = useState('');
   const [contractFilter, setContractFilter] = useState({ network: '', type: '' });
+
+  // Disputes
+  const [disputes, setDisputes] = useState([]);
+  const [resolveTarget, setResolveTarget] = useState(null);
 
   // Contract deployment
   const [deployForm, setDeployForm] = useState({ name: '', type: 'escrow', wasm: null });
@@ -144,7 +254,10 @@ export default function AdminDashboard() {
       const acknowledged = filter === 'all' ? undefined : filter === 'acknowledged' ? true : false;
       const res = await api.adminGetContractAlerts(acknowledged);
       setContractAlerts(res.data ?? []);
-    } catch (e) { console.error(e); }
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error(e);
+    }
     finally { setAlertsLoading(false); }
   }
 
@@ -160,6 +273,10 @@ export default function AdminDashboard() {
   const [invocLoading, setInvocLoading] = useState(false);
   const [invocError, setInvocError] = useState('');
 
+  async function loadDisputes() {
+    try { const res = await api.adminGetDisputes(); setDisputes(res.data ?? res); } catch {}
+  }
+
   async function loadStats() {
     try {
       const res = await api.adminGetStats();
@@ -169,7 +286,7 @@ export default function AdminDashboard() {
 
   async function loadUsers(page = 1) {
     try {
-      const res = await api.adminGetUsers(page);
+      const res = await api.adminGetUsers(page, { search: searchQuery, role: roleFilter, verified: verifiedFilter, banned: bannedFilter });
       setUsers(res.data);
       setPagination(res.pagination);
       setSearchParams(prev => { const p = new URLSearchParams(prev); p.set('usersPage', page); return p; });
@@ -194,6 +311,7 @@ export default function AdminDashboard() {
     loadContracts();
     loadContractAlerts('unacknowledged');
     loadAnnouncements();
+    loadDisputes();
   }, []);
 
   // Announcements
@@ -285,6 +403,38 @@ export default function AdminDashboard() {
       await api.adminDeactivateUser(id);
       loadUsers(pagination.page);
     } catch (e) { setError(e.message); }
+  }
+
+  function handleBan(id, name) {
+    setBanModalData({ id, name });
+  }
+
+  async function confirmBan(reason) {
+    const { id } = banModalData;
+    // Optimistic update
+    setUsers(prev => prev.map(u => u.id === id ? { ...u, banned_at: new Date().toISOString() } : u));
+    setBanBusy(true);
+    try {
+      await api.adminBanUser(id, reason);
+      setBanModalData(null);
+    } catch (e) {
+      // Revert on error
+      setUsers(prev => prev.map(u => u.id === id ? { ...u, banned_at: null } : u));
+      setError(e.message);
+    }
+    setBanBusy(false);
+  }
+
+  async function confirmUnban(id) {
+    // Optimistic update
+    setUsers(prev => prev.map(u => u.id === id ? { ...u, banned_at: null } : u));
+    try {
+      await api.adminUnbanUser(id);
+    } catch (e) {
+      // Revert on error
+      loadUsers(pagination.page);
+      setError(e.message);
+    }
   }
 
   async function loadContractState(e) {
@@ -417,6 +567,25 @@ export default function AdminDashboard() {
           onCancel={() => setDeactivateTarget(null)}
         />
       )}
+      {resolveTarget && (
+        <ResolveDisputeModal
+          dispute={resolveTarget}
+          onConfirm={async (id, body) => {
+            await api.adminResolveDispute(id, body);
+            setResolveTarget(null);
+            loadDisputes();
+          }}
+          onCancel={() => setResolveTarget(null)}
+        />
+      )}
+      {banModalData && (
+        <BanModal
+          user={banModalData}
+          onConfirm={confirmBan}
+          onCancel={() => setBanModalData(null)}
+          loading={banBusy}
+        />
+      )}
       <div style={s.title}>🛡️ Admin Dashboard</div>
       {error && <div style={s.err}>{error}</div>}
 
@@ -449,6 +618,45 @@ export default function AdminDashboard() {
 
       <div style={s.card}>
         <h3 style={{ marginBottom: 16, color: '#333' }}>Users ({pagination.total})</h3>
+        <div style={{ display: 'flex', gap: 12, marginBottom: 16, flexWrap: 'wrap' }}>
+          <input
+            type="text"
+            placeholder="Search by email or name…"
+            value={searchQuery}
+            onChange={e => setSearchQuery(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter') loadUsers(1); }}
+            style={{ flex: '1 1 200px', ...s.input }}
+          />
+          <select
+            value={roleFilter}
+            onChange={e => { setRoleFilter(e.target.value); }}
+            style={{ flex: '0 1 120px', ...s.input }}
+          >
+            <option value="">All Roles</option>
+            <option value="admin">Admin</option>
+            <option value="farmer">Farmer</option>
+            <option value="buyer">Buyer</option>
+          </select>
+          <select
+            value={verifiedFilter}
+            onChange={e => setVerifiedFilter(e.target.value)}
+            style={{ flex: '0 1 120px', ...s.input }}
+          >
+            <option value="">All Verified</option>
+            <option value="true">Yes</option>
+            <option value="false">No</option>
+          </select>
+          <select
+            value={bannedFilter}
+            onChange={e => setBannedFilter(e.target.value)}
+            style={{ flex: '0 1 120px', ...s.input }}
+          >
+            <option value="">All Banned</option>
+            <option value="true">Yes</option>
+            <option value="false">No</option>
+          </select>
+          <button onClick={() => loadUsers(1)} style={{ ...s.btn(false), flex: '0 1 auto' }}>Search</button>
+        </div>
         <table style={s.table}>
           <thead>
             <tr>
@@ -456,6 +664,8 @@ export default function AdminDashboard() {
               <th style={s.th}>Name</th>
               <th style={s.th}>Email</th>
               <th style={s.th}>Role</th>
+              <th style={s.th}>Verified</th>
+              <th style={s.th}>Banned At</th>
               <th style={s.th}>Joined</th>
               <th style={s.th}>Status</th>
               <th style={s.th}>Action</th>
@@ -468,17 +678,29 @@ export default function AdminDashboard() {
                 <td style={s.td}>{u.name}</td>
                 <td style={s.td}>{u.email}</td>
                 <td style={s.td}><span style={s.badge(u.role)}>{u.role}</span></td>
+                <td style={s.td}>{u.verified ? '✓' : '—'}</td>
+                <td style={s.td}>{u.banned_at ? new Date(u.banned_at).toLocaleDateString() : '—'}</td>
                 <td style={s.td}>{new Date(u.created_at).toLocaleDateString()}</td>
                 <td style={s.td}>
-                  {u.active === 0
+                  {u.banned_at
+                    ? <span style={{ color: '#c0392b', fontSize: 12, fontWeight: 600 }}>Banned</span>
+                    : u.active === 0
                     ? <span style={s.inactive}>Inactive</span>
                     : <span style={{ color: '#2d6a4f', fontSize: 12 }}>Active</span>}
                 </td>
                 <td style={s.td}>
                   {u.role !== 'admin' && u.active !== 0 && (
-                    <button style={s.deactivate} onClick={() => handleDeactivate(u.id, u.name)}>
-                      Deactivate
-                    </button>
+                    <>
+                      {u.banned_at ? (
+                        <button style={{ ...s.deactivate, background: '#d8f3dc', color: '#2d6a4f' }} onClick={() => confirmUnban(u.id)}>
+                          Unban
+                        </button>
+                      ) : (
+                        <button style={s.deactivate} onClick={() => handleBan(u.id, u.name)}>
+                          Ban
+                        </button>
+                      )}
+                    </>
                   )}
                 </td>
               </tr>
@@ -543,6 +765,55 @@ export default function AdminDashboard() {
             onClick={() => loadOrders(orderPagination.page + 1)}
           >Next →</button>
         </div>
+      </div>
+
+      {/* Disputes */}
+      <div style={{ ...s.card, marginTop: 32 }}>
+        <h3 style={{ marginBottom: 16, color: '#333' }}>⚖️ Disputes ({disputes.length})</h3>
+        {disputes.length === 0 ? (
+          <div style={{ color: '#888', fontSize: 14 }}>No disputes filed.</div>
+        ) : (
+          <table style={s.table}>
+            <thead>
+              <tr>
+                <th style={s.th}>ID</th>
+                <th style={s.th}>Buyer</th>
+                <th style={s.th}>Product</th>
+                <th style={s.th}>Qty</th>
+                <th style={s.th}>Total (XLM)</th>
+                <th style={s.th}>Status</th>
+                <th style={s.th}>Reason</th>
+                <th style={s.th}>Resolution</th>
+                <th style={s.th}>Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              {disputes.map(d => {
+                const statusColor = d.status === 'resolved' ? '#2d6a4f' : d.status === 'under_review' ? '#b8860b' : '#c0392b';
+                const statusBg = d.status === 'resolved' ? '#d8f3dc' : d.status === 'under_review' ? '#ffeaa7' : '#fee';
+                return (
+                  <tr key={d.id}>
+                    <td style={s.td}>{d.id}</td>
+                    <td style={s.td}>{d.buyer_name}<br /><span style={{ fontSize: 11, color: '#aaa' }}>{d.buyer_email}</span></td>
+                    <td style={s.td}>{d.product_name}</td>
+                    <td style={s.td}>{d.quantity}</td>
+                    <td style={s.td}>{Number(d.total_price).toFixed(2)}</td>
+                    <td style={s.td}>
+                      <span style={{ ...s.badge(d.status), background: statusBg, color: statusColor }}>{d.status.replace('_', ' ')}</span>
+                    </td>
+                    <td style={{ ...s.td, maxWidth: 160, wordBreak: 'break-word', fontSize: 13 }}>{d.reason}</td>
+                    <td style={{ ...s.td, maxWidth: 160, wordBreak: 'break-word', fontSize: 13, color: '#555' }}>{d.resolution || '—'}</td>
+                    <td style={s.td}>
+                      {d.status !== 'resolved' && (
+                        <button style={s.deactivate} onClick={() => setResolveTarget(d)}>Resolve</button>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
       </div>
 
       {/* Contract Deployment */}

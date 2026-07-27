@@ -164,6 +164,34 @@ async function checkSorobanRPC() {
   }
 }
 
+async function checkRedis() {
+  const startTime = Date.now();
+  try {
+    if (!process.env.REDIS_URL) {
+      return { status: 'not_configured', responseTime: '0ms' };
+    }
+    let Redis;
+    try {
+      Redis = require('ioredis');
+    } catch {
+      return { status: 'not_available', responseTime: '0ms', error: 'ioredis not installed' };
+    }
+    const testClient = new Redis(process.env.REDIS_URL, {
+      lazyConnect: true,
+      enableOfflineQueue: false,
+      connectTimeout: 3000
+    });
+    await testClient.ping();
+    testClient.disconnect();
+    const duration = Date.now() - startTime;
+    return { status: 'ok', responseTime: `${duration}ms` };
+  } catch (error) {
+    const duration = Date.now() - startTime;
+    logger.error('Redis health check failed:', { error: error.message });
+    return { status: 'down', responseTime: `${duration}ms`, error: error.message };
+  }
+}
+
 // ============================================================================
 // Health Endpoint Handler
 // ============================================================================
@@ -171,16 +199,18 @@ async function checkSorobanRPC() {
 async function getHealthCheckResponse(includeVersion = false) {
   const startTime = Date.now();
   try {
-    const [dbCheck, horizonCheck, sorobanCheck] = await Promise.all([
+    const [dbCheck, horizonCheck, sorobanCheck, redisCheck] = await Promise.all([
       checkDatabase(),
       checkStellarHorizon(),
-      checkSorobanRPC()
+      checkSorobanRPC(),
+      checkRedis()
     ]);
-    
+
     const checks = {
       database: dbCheck,
       horizon: horizonCheck,
-      soroban: sorobanCheck
+      soroban: sorobanCheck,
+      redis: redisCheck
     };
     
     const criticalDown = [dbCheck.status, horizonCheck.status].some(status => status === 'down');
@@ -236,9 +266,10 @@ function addDeprecationHeaders(req, res, next) {
 // ============================================================================
 
 router.get('/sitemap.xml', require('./sitemap'));
-router.get('/robots.txt', (_, res) => {
+router.get('/robots.txt', (req, res) => {
+  const host = process.env.BACKEND_URL || `${req.protocol}://${req.get('host')}`;
   res.type('text/plain').send(
-    `User-agent: *\nAllow: /\nDisallow: /api/\nSitemap: ${process.env.FRONTEND_URL || 'http://localhost:3000'}/sitemap.xml`
+    `User-agent: *\nAllow: /\nDisallow: /api/\nSitemap: ${host}/sitemap.xml`
   );
 });
 
@@ -314,6 +345,7 @@ router.use('/federation', require('./federation'));
 // API Routes - registered for both /api and /api/v1
 registerRoute('/', '/auth', require('./auth'));
 registerRoute('/', '/products', require('./products'));
+registerRoute('/', '/orders', require('./orderBudgetGuard'));
 registerRoute('/', '/orders', require('./orders'));
 registerRoute('/', '/orders/:id/return', require('./returns'));
 registerRoute('/', '/waitlist', require('./waitlist'));
@@ -329,24 +361,31 @@ registerRoute('/', '/addresses', require('./addresses'));
 registerRoute('/', '/messages', require('./messages'));
 registerRoute('/', '/notifications', require('./notifications'));
 registerRoute('/', '/contracts', require('./contracts'));
+registerRoute('/', '/escrow', require('./escrow'));
+registerRoute('/', '/creator-earnings', require('./creatorEarnings'));
+registerRoute('/', '/paymentStreams', require('./paymentStreams'));
 registerRoute('/', '/products/bulk', require('./bulkUpload'));
 registerRoute('/', '/coupons', require('./coupons'));
 registerRoute('/', '/alerts', require('./alerts'));
 registerRoute('/', '/products/import', require('./productImport'));
 registerRoute('/', '', require('./reviews'));
-registerRoute('/', '', require('./network'));
+registerRoute('/', '/network', require('./network'));
 registerRoute('/', '/batches', require('./batches'));
 registerRoute('/', '/products/flashSales', require('./flashSales'));
-registerRoute('/', '/products/videos', require('./productVideos'));
+registerRoute('/', '/products', require('./productVideos'));
 registerRoute('/', '/products/:id/calendar', require('./calendar'));
-registerRoute('/', '/orders/budget', require('./orderBudgetGuard'));
-registerRoute('/', '/wallet/budget', require('./walletBudget'));
+registerRoute('/', '/calendar', require('./calendar'));
+registerRoute('/', '/wallet', require('./walletBudget'));
 registerRoute('/', '/products/share', require('./productShare'));
 registerRoute('/', '/products/market', require('./market'));
+registerRoute('/', '/market', require('./market'));
 registerRoute('/', '/subscriptions', require('./subscriptions').router);
 registerRoute('/', '/bundles', require('./bundles'));
 registerRoute('/', '/farmers/bundles', require('./bundleDiscounts'));
 registerRoute('/', '', require('./export'));
 registerRoute('/', '/announcements', require('./announcements'));
+registerRoute('/', '/auctions', require('./auctions'));
+
+registerRoute('/', '/categories', require('./categories'));
 
 module.exports = router;
