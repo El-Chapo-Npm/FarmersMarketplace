@@ -115,6 +115,7 @@ jest.mock('../src/routes', () => {
   router.use('/api/products', require('../src/routes/products'));
   router.use('/api/orders', require('../src/routes/orders'));
   router.use('/api/orders/:id/return', require('../src/routes/returns'));
+  router.use('/api/disputes', require('../src/routes/disputes'));
   router.use('/api/analytics', require('../src/routes/analytics'));
   router.use('/api/notifications', require('../src/routes/notifications'));
   router.use('/api/creator-earnings', require('../src/routes/creatorEarnings'));
@@ -123,6 +124,15 @@ jest.mock('../src/routes', () => {
   router.use('/api/batches', require('../src/routes/batches'));
   router.use('/api/network', require('../src/routes/network'));
   router.use('/api/market', require('../src/routes/market'));
+  // #1004 bundles & bundle-discounts
+  router.use('/api/bundles', require('../src/routes/bundles'));
+  router.use('/api/farmers', require('../src/routes/bundleDiscounts'));
+  // #1005 product import
+  router.use('/api/products/import', require('../src/routes/productImport'));
+  // #1006 product videos
+  router.use('/api/products', require('../src/routes/productVideos'));
+  // #1007 product share
+  router.use('/api/products', require('../src/routes/productShare'));
   return router;
 });
 
@@ -140,6 +150,8 @@ jest.mock('../src/utils/mailer', () => ({
   sendAuctionSaleEmail: jest.fn().mockResolvedValue({}),
   sendAuctionNoSaleEmail: jest.fn().mockResolvedValue({}),
   sendSubscriptionPaymentFailedEmail: jest.fn().mockResolvedValue({}),
+  sendDisputeOpenedEmail: jest.fn().mockResolvedValue({}),
+  sendDisputeResolvedEmail: jest.fn().mockResolvedValue({}),
 }));
 
 // --- requestLogger mock (uuid v13 is ESM-only, incompatible with Jest CJS) ---
@@ -212,6 +224,8 @@ beforeEach(() => {
   if (mailer.sendAuctionSaleEmail) mailer.sendAuctionSaleEmail.mockResolvedValue({});
   if (mailer.sendAuctionNoSaleEmail) mailer.sendAuctionNoSaleEmail.mockResolvedValue({});
   if (mailer.sendSubscriptionPaymentFailedEmail) mailer.sendSubscriptionPaymentFailedEmail.mockResolvedValue({});
+  if (mailer.sendDisputeOpenedEmail) mailer.sendDisputeOpenedEmail.mockResolvedValue({});
+  if (mailer.sendDisputeResolvedEmail) mailer.sendDisputeResolvedEmail.mockResolvedValue({});
   mailer.sendOrderEmails?.mockResolvedValue({});
   mailer.sendLowStockAlert?.mockResolvedValue({});
   mailer.sendStatusUpdateEmail?.mockResolvedValue({});

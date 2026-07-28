@@ -654,14 +654,29 @@ Farmers Marketplace`;
           continue;
         }
 
-        // Try to create automatic order
-        const orderResult = await this.createAutomaticOrder(entry, product, {
-          id: entry.buyer_id,
-          name: entry.buyer_name,
-          email: entry.buyer_email,
-          stellar_public_key: entry.stellar_public_key,
-          stellar_secret_key: entry.stellar_secret_key,
-        });
+        // Try to create automatic order. An unexpected throw (e.g. a Stellar
+        // submission error) must not abort the entire batch — catch it here and
+        // treat it as a skipped entry so the next buyer in the queue is still
+        // processed. (#1016)
+        let orderResult;
+        try {
+          orderResult = await this.createAutomaticOrder(entry, product, {
+            id: entry.buyer_id,
+            name: entry.buyer_name,
+            email: entry.buyer_email,
+            stellar_public_key: entry.stellar_public_key,
+            stellar_secret_key: entry.stellar_secret_key,
+          });
+        } catch (entryErr) {
+          console.error(
+            `[AutomaticOrderProcessor] Unexpected error for waitlist entry #${entry.id} — skipping to next:`,
+            entryErr.message
+          );
+          skipped++;
+          errors.push({ entryId: entry.id, buyerId: entry.buyer_id, error: entryErr.message, code: 'INTERNAL_ERROR' });
+          await db.query('UPDATE waitlist_entries SET status = $1 WHERE id = $2', ['payment_failed', entry.id]);
+          continue;
+        }
 
         if (orderResult.success) {
           // Order created successfully
