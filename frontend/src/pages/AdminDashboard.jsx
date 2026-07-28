@@ -80,27 +80,28 @@ function BanModal({ user, onConfirm, onCancel, loading }) {
 
 function ResolveDisputeModal({ dispute, onConfirm, onCancel }) {
   const confirmRef = useRef(null);
-  const [status, setStatus] = useState(dispute.status === 'open' ? 'under_review' : 'resolved');
-  const [resolution, setResolution] = useState('');
+  const [resolution, setResolution] = useState('farmer');
+  const [splitPercentBuyer, setSplitPercentBuyer] = useState('50');
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
   useEffect(() => { confirmRef.current?.focus(); }, []);
   async function handleSubmit(e) {
     e.preventDefault();
-    if (status === 'resolved' && !resolution.trim()) { setErr('Resolution note is required.'); return; }
     setBusy(true);
     setErr('');
-    try { await onConfirm(dispute.id, { status, resolution: resolution.trim() || undefined }); }
+    const body = resolution === 'split'
+      ? { resolution, split_percent_buyer: Number(splitPercentBuyer) }
+      : { resolution };
+    try { await onConfirm(dispute.id, body); }
     catch (e) { setErr(e.message); setBusy(false); }
   }
-  const nextStatuses = dispute.status === 'open' ? ['under_review'] : dispute.status === 'under_review' ? ['resolved'] : [];
   return (
     <div role="dialog" aria-modal="true" aria-labelledby="resolve-modal-title"
       onKeyDown={e => e.key === 'Escape' && onCancel()}
       style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }}>
       <div style={{ background: '#fff', borderRadius: 12, padding: 28, maxWidth: 460, width: '90%', boxShadow: '0 4px 24px #0003' }}>
         <div id="resolve-modal-title" style={{ fontWeight: 700, fontSize: 17, marginBottom: 6, color: '#333' }}>
-          Update Dispute #{dispute.id}
+          Resolve Dispute #{dispute.id}
         </div>
         <div style={{ fontSize: 13, color: '#666', marginBottom: 16 }}>
           <strong>{dispute.product_name}</strong> · {dispute.buyer_name} · {Number(dispute.total_price).toFixed(2)} XLM
@@ -109,23 +110,25 @@ function ResolveDisputeModal({ dispute, onConfirm, onCancel }) {
           <strong>Reason:</strong> {dispute.reason}
         </div>
         <form onSubmit={handleSubmit}>
-          <label style={{ display: 'block', fontSize: 13, color: '#555', marginBottom: 4 }}>New Status</label>
-          <select value={status} onChange={e => setStatus(e.target.value)}
+          <label style={{ display: 'block', fontSize: 13, color: '#555', marginBottom: 4 }}>Resolve in favor of</label>
+          <select ref={confirmRef} value={resolution} onChange={e => setResolution(e.target.value)}
             style={{ width: '100%', padding: '8px 12px', border: '1px solid #ddd', borderRadius: 8, fontSize: 14, marginBottom: 14 }}>
-            {nextStatuses.map(s => <option key={s} value={s}>{s.replace('_', ' ')}</option>)}
+            <option value="farmer">Farmer (release funds)</option>
+            <option value="buyer">Buyer (refund)</option>
+            <option value="split">Split</option>
           </select>
-          {status === 'resolved' && (
+          {resolution === 'split' && (
             <>
-              <label style={{ display: 'block', fontSize: 13, color: '#555', marginBottom: 4 }}>Resolution Note</label>
-              <textarea ref={confirmRef} required value={resolution} onChange={e => setResolution(e.target.value)}
-                placeholder="Describe the resolution (release/refund/other)…"
-                style={{ width: '100%', padding: '8px 12px', border: '1px solid #ddd', borderRadius: 8, fontSize: 14, resize: 'vertical', minHeight: 80, boxSizing: 'border-box', marginBottom: 14 }} />
+              <label style={{ display: 'block', fontSize: 13, color: '#555', marginBottom: 4 }}>Buyer share (%)</label>
+              <input type="number" min="0" max="100" required value={splitPercentBuyer}
+                onChange={e => setSplitPercentBuyer(e.target.value)}
+                style={{ width: '100%', padding: '8px 12px', border: '1px solid #ddd', borderRadius: 8, fontSize: 14, marginBottom: 14, boxSizing: 'border-box' }} />
             </>
           )}
           {err && <div style={{ color: '#c0392b', fontSize: 13, marginBottom: 10 }}>{err}</div>}
           <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
             <button type="button" onClick={onCancel} style={{ padding: '8px 18px', borderRadius: 8, border: '1px solid #ddd', background: '#fff', cursor: 'pointer', fontWeight: 600 }}>Cancel</button>
-            <button type="submit" ref={status !== 'resolved' ? confirmRef : undefined} disabled={busy}
+            <button type="submit" disabled={busy}
               style={{ padding: '8px 18px', borderRadius: 8, border: 'none', background: busy ? '#ccc' : '#2d6a4f', color: '#fff', cursor: busy ? 'not-allowed' : 'pointer', fontWeight: 600 }}>
               {busy ? 'Saving…' : 'Confirm'}
             </button>
