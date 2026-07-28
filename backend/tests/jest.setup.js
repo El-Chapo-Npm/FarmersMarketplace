@@ -28,6 +28,7 @@ jest.mock('../src/db/schema', () => ({
 // --- Stellar mock ---
 jest.mock('../src/utils/stellar', () => ({
   isTestnet: true,
+  getOrderBook: jest.fn().mockResolvedValue({ bids: [], asks: [], base: 'XLM', counter: 'USDC' }),
   server: {
     payments: jest.fn(() => ({
       forAccount: jest.fn().mockReturnThis(),
@@ -119,6 +120,10 @@ jest.mock('../src/routes', () => {
   router.use('/api/notifications', require('../src/routes/notifications'));
   router.use('/api/creator-earnings', require('../src/routes/creatorEarnings'));
   router.use('/api/admin', require('../src/routes/admin'));
+  router.use('/api/calendar', require('../src/routes/calendar'));
+  router.use('/api/batches', require('../src/routes/batches'));
+  router.use('/api/network', require('../src/routes/network'));
+  router.use('/api/market', require('../src/routes/market'));
   // #1004 bundles & bundle-discounts
   router.use('/api/bundles', require('../src/routes/bundles'));
   router.use('/api/farmers', require('../src/routes/bundleDiscounts'));
@@ -203,6 +208,7 @@ beforeEach(() => {
   stellar.simulateContractCall = jest.fn();
   stellar.invokeContract = jest.fn();
   stellar.getContractWasmHash = jest.fn().mockResolvedValue('0'.repeat(64));
+  stellar.getOrderBook?.mockResolvedValue({ bids: [], asks: [], base: 'XLM', counter: 'USDC' });
 
   const mailer = jest.requireMock('../src/utils/mailer');
   mailer.sendOrderEmails.mockResolvedValue({});
