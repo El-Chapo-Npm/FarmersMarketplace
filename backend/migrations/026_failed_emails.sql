@@ -15,3 +15,11 @@ CREATE TABLE IF NOT EXISTS failed_emails (
 
 -- Index for efficient pruning queries
 CREATE INDEX IF NOT EXISTS idx_failed_emails_created_at ON failed_emails(created_at);
+CREATE TABLE IF NOT EXISTS failed_emails (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  recipient TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  error TEXT NOT NULL,
+  type TEXT NOT NULL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);

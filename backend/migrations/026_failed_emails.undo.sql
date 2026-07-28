@@ -3,3 +3,4 @@
 
 DROP INDEX IF EXISTS idx_failed_emails_created_at;
 DROP TABLE IF EXISTS failed_emails;
+DROP TABLE IF EXISTS failed_emails;
