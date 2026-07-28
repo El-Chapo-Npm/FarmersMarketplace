@@ -532,6 +532,12 @@ export default function Marketplace() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Clamp page when totalPages shrinks (defense in depth)
+  useEffect(() => {
+    if (pageRef.current > totalPages) {
+      pageRef.current = totalPages;
+    }
+  }, [totalPages]);
   // Save scroll position continuously for SPA back-navigation
   useEffect(() => {
     const saveScroll = () => sessionStorage.setItem(SCROLL_KEY + '_y', String(window.scrollY));
