@@ -1362,6 +1362,7 @@ export default function Dashboard() {
                             value={p.price}
                             type="number"
                             min={0.0000001}
+                            max={999999}
                             step="any"
                             format={(v) => `${v} XLM`}
                             onSave={(v) => handleInlineSave(p.id, 'price', v)}
@@ -1374,6 +1375,7 @@ export default function Dashboard() {
                         value={p.quantity}
                         type="number"
                         min={0}
+                        max={99999}
                         step={1}
                         format={(v) => `${v} ${p.unit}`}
                         onSave={(v) => handleInlineSave(p.id, 'quantity', Math.floor(v))}
