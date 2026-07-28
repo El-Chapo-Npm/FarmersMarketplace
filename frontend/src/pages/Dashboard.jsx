@@ -77,6 +77,33 @@ const s = {
     fontSize: 12,
   },
   msg: { padding: '10px 14px', borderRadius: 8, marginBottom: 12, fontSize: 14 },
+};
+
+const EMPTY_FORM = {
+  name: '',
+  description: '',
+  price: '',
+  quantity: '',
+  unit: 'kg',
+  category: 'other',
+  min_order_quantity: '',
+  batch_id: '',
+  pricing_type: 'unit',
+  min_weight: '',
+  max_weight: '',
+  pricing_model: 'fixed',
+  min_price: '',
+  is_preorder: false,
+  preorder_delivery_date: '',
+  allergens: [],
+  allowed_regions: [],
+  nutrition: {
+    calories: '',
+    protein: '',
+    carbs: '',
+    fat: '',
+    fiber: '',
+    vitamins: {},
   preview: {
     width: '100%',
     maxHeight: 240,
@@ -210,6 +237,11 @@ export default function Dashboard() {
   const [videoUploadingByProduct, setVideoUploadingByProduct] = useState({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+
+  // Creator earnings
+  const [earnings, setEarnings] = useState(null);
+  const [claiming, setClaiming] = useState(false);
+  const [claimMsg, setClaimMsg] = useState(null);
 
   // bulk price update state
   const [bulkPriceSelections, setBulkPriceSelections] = useState({}); // { [productId]: newPrice }
@@ -459,6 +491,86 @@ export default function Dashboard() {
 
   useEffect(() => {
     load();
+    // Load current profile
+    if (user?.id) {
+      api.getFarmer(user.id)
+        .then(res => {
+          const d = res.data;
+          setProfile({ bio: d.bio || '', location: d.location || '', avatar_url: d.avatar_url || '', federation_name: d.federation_name || '', latitude: d.latitude ?? '', longitude: d.longitude ?? '', farm_address: d.farm_address || '' });
+          if (d.avatar_url) setAvatarPreview(d.avatar_url);
+        })
+        .catch(() => {});
+    }
+    if (typeof api.getCreatorEarnings === 'function') {
+      api.getCreatorEarnings().then(res => setEarnings(res.data ?? res)).catch(() => {});
+    }
+  }, [user?.id]);
+
+  async function handleClaimEarnings() {
+    setClaiming(true);
+    setClaimMsg(null);
+    try {
+      await api.claimCreatorEarnings();
+      setEarnings(prev => (prev ? { ...prev, balance: 0 } : prev));
+      setClaimMsg({ type: 'ok', text: 'Earnings claimed successfully.' });
+    } catch (e) {
+      setClaimMsg({ type: 'err', text: getErrorMessage(e) });
+    } finally {
+      setClaiming(false);
+    }
+  }
+
+  async function handleCreateBatch(e) {
+    e?.preventDefault?.();
+    setBatchMsg(null);
+    const code = batchForm.batch_code.trim();
+    const date = batchForm.harvest_date.trim();
+    if (!code || !date) {
+      setBatchMsg({ type: 'err', text: 'Batch code and harvest date are required.' });
+      return;
+    }
+    try {
+      await api.createHarvestBatch({
+        batch_code: code,
+        harvest_date: date,
+        notes: batchForm.notes.trim() || undefined,
+      });
+      setBatchForm({ batch_code: '', harvest_date: '', notes: '' });
+      setBatchMsg({ type: 'ok', text: 'Harvest batch created.' });
+      await load();
+    } catch (err) {
+      setBatchMsg({ type: 'err', text: getErrorMessage(err) });
+    }
+  }
+
+  function validateAndSetImage(file) {
+    setImageErr('');
+    if (!ALLOWED_TYPES.includes(file.type)) {
+      setImageErr('Only JPEG, PNG, or WebP images are allowed.');
+      return false;
+    }
+    if (file.size > MAX_SIZE_BYTES) {
+      setImageErr(`Image must be ${MAX_SIZE_MB} MB or smaller.`);
+      return false;
+    }
+    setImageFile(file);
+    setPreviewUrl(URL.createObjectURL(file));
+    setImageUrl(null); // reset confirmed URL until uploaded
+    return true;
+  }
+
+  function handleFileChange(e) {
+    const file = e.target.files?.[0];
+    if (file) validateAndSetImage(file);
+    e.target.value = ''; // allow re-selecting same file
+  }
+
+  function handleDrop(e) {
+    e.preventDefault();
+    setDragOver(false);
+    const file = e.dataTransfer.files?.[0];
+    if (file) validateAndSetImage(file);
+  }
   }, [user?.id]);
 
   useEffect(() => {
@@ -527,6 +639,74 @@ export default function Dashboard() {
       setProfileMsg({ type: 'ok', text: t('dashboard.profileUpdated') });
     } catch (err) {
       setProfileMsg({ type: 'err', text: getErrorMessage(err) });
+    }
+  }
+
+  async function handleAdd(e) {
+    e.preventDefault();
+    setMsg(null);
+    const newErrors = {};
+    if (form.is_preorder) {
+      if (!form.preorder_delivery_date) {
+        newErrors.preorder_delivery_date = 'Date must be in YYYY-MM-DD format';
+      } else if (!/^\d{4}-\d{2}-\d{2}$/.test(form.preorder_delivery_date)) {
+        newErrors.preorder_delivery_date = 'Date must be in YYYY-MM-DD format';
+      }
+    }
+    if (Object.keys(newErrors).length > 0) { setFormErrors(newErrors); return; }
+    setFormErrors({});
+    let finalImageUrl = imageUrl;
+
+    if (imageFile) {
+      setUploading(true);
+      try {
+        const res = await api.uploadImage(imageFile);
+        finalImageUrl = res.imageUrl;
+      } catch (err) {
+        setUploading(false);
+        setMsg({ type: 'err', text: `Image upload failed: ${err.message}` });
+        return;
+      }
+      setUploading(false);
+    }
+
+    try {
+      // Prepare nutrition data
+      const nutritionData = {};
+      if (form.nutrition.calories) nutritionData.calories = parseFloat(form.nutrition.calories);
+      if (form.nutrition.protein) nutritionData.protein = parseFloat(form.nutrition.protein);
+      if (form.nutrition.carbs) nutritionData.carbs = parseFloat(form.nutrition.carbs);
+      if (form.nutrition.fat) nutritionData.fat = parseFloat(form.nutrition.fat);
+      if (form.nutrition.fiber) nutritionData.fiber = parseFloat(form.nutrition.fiber);
+
+      const batchId = form.batch_id ? parseInt(form.batch_id, 10) : undefined;
+
+      await api.createProduct({
+        ...form,
+        price: parseFloat(form.price),
+        quantity: parseInt(form.quantity),
+        pricing_model: form.pricing_model,
+        min_price: form.pricing_model === 'pwyw' ? parseFloat(form.min_price) : undefined,
+        is_preorder: form.is_preorder ? 1 : 0,
+        preorder_delivery_date: form.is_preorder ? form.preorder_delivery_date : null,
+        image_url: finalImageUrl || undefined,
+        nutrition: Object.keys(nutritionData).length > 0 ? nutritionData : undefined,
+        pricing_type: form.pricing_type || 'unit',
+        min_weight: form.pricing_type === 'weight' ? parseFloat(form.min_weight) : undefined,
+        max_weight: form.pricing_type === 'weight' ? parseFloat(form.max_weight) : undefined,
+        min_order_quantity: form.min_order_quantity ? parseInt(form.min_order_quantity) : undefined,
+        allergens: form.allergens && form.allergens.length > 0 ? form.allergens : undefined,
+        allowed_regions: form.allowed_regions && form.allowed_regions.length > 0 ? form.allowed_regions : undefined,
+        available_from: form.available_from || undefined,
+        available_until: form.available_until || undefined,
+        batch_id: Number.isFinite(batchId) ? batchId : undefined,
+      });
+      setMsg({ type: 'ok', text: t('dashboard.productListedOk') });
+      setForm({ ...EMPTY_FORM });
+      removeImage();
+      load();
+    } catch (err) {
+      setMsg({ type: 'err', text: err.message });
     }
   }
 
@@ -986,6 +1166,59 @@ export default function Dashboard() {
         </div>
       )}
 
+      <div style={{ ...s.card, marginBottom: 24 }}>
+        <h3 style={{ marginBottom: 12, color: '#333' }}>💰 Creator Earnings</h3>
+        <div style={{ fontSize: 28, fontWeight: 700, color: '#2d6a4f' }}>
+          {earnings ? Number(earnings.balance ?? 0).toFixed(2) : '-'} XLM
+        </div>
+        <div style={{ fontSize: 13, color: '#888', marginTop: 4 }}>Accumulated on-chain earnings available to claim.</div>
+        <button
+          style={{ ...s.btn, marginTop: 14, opacity: !earnings || Number(earnings.balance ?? 0) <= 0 ? 0.5 : 1 }}
+          disabled={claiming || !earnings || Number(earnings.balance ?? 0) <= 0}
+          onClick={handleClaimEarnings}
+        >
+          {claiming ? 'Claiming...' : 'Claim Earnings'}
+        </button>
+        {claimMsg && (
+          <div role="status" style={{ ...s.msg, marginTop: 12, background: claimMsg.type === 'ok' ? '#d8f3dc' : '#fee', color: claimMsg.type === 'ok' ? '#2d6a4f' : '#c0392b' }}>
+            {claimMsg.text}
+          </div>
+        )}
+      </div>
+
+      <div style={{ ...s.card, marginBottom: 24 }}>
+        <h3 style={{ marginBottom: 12, color: '#333' }}>Flash Sales</h3>
+        {flashSaleMsg && <div style={{ ...s.msg, background: flashSaleMsg.type === 'ok' ? '#d8f3dc' : '#fee', color: flashSaleMsg.type === 'ok' ? '#2d6a4f' : '#c0392b' }}>{flashSaleMsg.text}</div>}
+        <form onSubmit={handleSetFlashSale} style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr auto', gap: 10, alignItems: 'end' }}>
+          <div>
+            <label style={s.label}>Product</label>
+            <select style={s.input} value={flashSaleForm.product_id} onChange={(e) => setFlashSaleForm((f) => ({ ...f, product_id: e.target.value }))} required>
+              <option value="">Select product</option>
+              {products.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+            </select>
+          </div>
+          <div>
+            <label style={s.label}>Flash Price (XLM)</label>
+            <input style={s.input} type="number" min="0" step="any" required value={flashSaleForm.flash_sale_price} onChange={(e) => setFlashSaleForm((f) => ({ ...f, flash_sale_price: e.target.value }))} />
+          </div>
+          <div>
+            <label style={s.label}>Ends At</label>
+            <input style={s.input} type="datetime-local" required value={flashSaleForm.flash_sale_ends_at} onChange={(e) => setFlashSaleForm((f) => ({ ...f, flash_sale_ends_at: e.target.value }))} />
+          </div>
+          <button type="submit" style={s.btn}>Set Flash Sale</button>
+        </form>
+
+        <div style={{ marginTop: 14 }}>
+          {products.filter((p) => p.flash_sale_price && p.flash_sale_ends_at).map((p) => (
+            <div key={p.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderTop: '1px solid #eee', paddingTop: 10, marginTop: 10 }}>
+              <div style={{ fontSize: 14 }}>
+                <strong>{p.name}</strong> - {p.flash_sale_price} XLM until {new Date(p.flash_sale_ends_at).toLocaleString()}
+              </div>
+              <button type="button" style={{ ...s.btn, background: '#c0392b' }} onClick={() => handleCancelFlashSale(p.id)}>Cancel</button>
+            </div>
+          ))}
+        </div>
+      </div>
       <FlashSaleManager products={products} onChanged={load} />
 
       {/* Bulk Price Update */}
@@ -1075,6 +1308,10 @@ export default function Dashboard() {
               ⬇ PDF
             </button>
           </div>
+          {products.length === 0 && <p style={{ color: '#888', fontSize: 14 }}>No products yet. Add your first listing.</p>}
+          {products.map(p => (
+            <div key={p.id} style={{ ...s.product, flexDirection: 'column', alignItems: 'stretch' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           {products.length === 0 && (
             <p style={{ color: '#888', fontSize: 14 }}>No products yet. Add your first listing.</p>
           )}

@@ -388,6 +388,16 @@ export const api = {
   adminUpdateAnnouncement: (id, body) => request(`/announcements/admin/${id}`, { method: 'PATCH', body }),
   adminDeleteAnnouncement: (id) => request(`/announcements/admin/${id}`, { method: 'DELETE' }),
 
+  // Creator earnings (Stellar claim)
+  getCreatorEarnings: () => request('/wallet/earnings'),
+  claimCreatorEarnings: () => request('/wallet/earnings/claim', { method: 'POST' }),
+
+  // Payment streams
+  getPaymentStreams: () => request('/streams'),
+  createPaymentStream: (body) => request('/streams', { method: 'POST', body }),
+  cancelPaymentStream: (id) => request(`/streams/${id}/cancel`, { method: 'POST' }),
+  decreasePaymentStreamRate: (id, rate) => request(`/streams/${id}/decrease-rate`, { method: 'PATCH', body: { rate } }),
+  withdrawPaymentStream: (id) => request(`/streams/${id}/withdraw`, { method: 'POST' }),
   // Claimable balances
   getClaimableBalances: () => request('/wallet/claimable-balances'),
   claimBalance: (balance_id) => request('/wallet/claim', { method: 'POST', body: { balance_id } }),
