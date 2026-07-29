@@ -4,30 +4,45 @@
  * Covers:
  *   - A buyer applies a valid coupon on a product detail page and the
  *     discounted total is shown correctly.
- *   - A buyer enters an invalid (nonexistent) coupon code and sees a clear
- *     inline error with no discount applied.
+ *   - A buyer enters an invalid (nonexistent) coupon code and asserts a
+ *     clear inline error with no discount applied.
  *
  * Seeding strategy:
- *   We create a farmer + product + coupon entirely through the API so the
- *   tests are self-contained and do not depend on any pre-existing DB state.
- *   CSRF token is fetched once and reused for all mutating API calls.
+ *   We create a farmer + product + coupon via the UI / API so the tests are
+ *   self-contained and do not depend on any pre-existing DB state.
+ *
+ * CSRF notes:
+ *   The backend exposes the CSRF seed endpoint at /api/csrf-token (app.js).
+ *   The /api/v1 prefix only covers the business-logic routes registered via
+ *   registerRoute() — NOT the csrf-token endpoint — so we must call
+ *   /api/csrf-token here.
+ *
+ *   However, the frontend client.js auto-fetches the CSRF cookie before any
+ *   mutating call; for API-level seeding from the test runner we call the
+ *   endpoint ourselves to obtain the cookie that the browser context will
+ *   forward on subsequent requests.  We pass it as both a cookie and as the
+ *   x-csrf-token header to satisfy the double-submit-cookie check.
  */
 
 import { test, expect, APIRequestContext } from '@playwright/test';
 
 const ts = Date.now();
-const FARMER_EMAIL = `farmer_coupon_${ts}@test.invalid`;
-const BUYER_EMAIL  = `buyer_coupon_${ts}@test.invalid`;
-const PASS         = 'TestPass1!';
-const PRODUCT_NAME = `Coupon Apples ${ts}`;
+const FARMER_EMAIL  = `farmer_coupon_${ts}@test.invalid`;
+const BUYER_EMAIL   = `buyer_coupon_${ts}@test.invalid`;
+const PASS          = 'TestPass1!';
+const PRODUCT_NAME  = `Coupon Apples ${ts}`;
 const PRODUCT_PRICE = 10; // XLM
 const COUPON_CODE   = `SAVE20_${ts}`;
 const DISCOUNT_PCT  = 20;
 
-// ─── helpers ───────────────────────────────────────────────────────────────
+// ─── helpers ─────────────────────────────────────────────────────────────────
 
+/**
+ * Seed the CSRF cookie and return the token value so we can also send it as
+ * the x-csrf-token header.  The endpoint is at /api/csrf-token (app.js).
+ */
 async function getCsrf(req: APIRequestContext): Promise<string> {
-  const res  = await req.get('/api/v1/csrf-token');
+  const res  = await req.get('/api/csrf-token');
   const body = await res.json();
   return body.csrfToken as string;
 }
@@ -42,7 +57,7 @@ async function apiLogin(
   return body.token as string;
 }
 
-// ─── seed ──────────────────────────────────────────────────────────────────
+// ─── seed ─────────────────────────────────────────────────────────────────────
 
 let productId: number;
 
@@ -50,7 +65,7 @@ test.beforeAll(async ({ browser }) => {
   const ctx  = await browser.newContext();
   const page = await ctx.newPage();
 
-  // 1. Register farmer
+  // 1. Register farmer via UI
   await page.goto('/register');
   await page.fill('#reg-name',     `Coupon Farmer ${ts}`);
   await page.fill('#reg-email',    FARMER_EMAIL);
@@ -59,7 +74,7 @@ test.beforeAll(async ({ browser }) => {
   await page.click('button[type="submit"]');
   await expect(page).toHaveURL(/\/dashboard/, { timeout: 15_000 });
 
-  // 2. List a product via dashboard form
+  // 2. List a product via the dashboard form
   await page.fill('#prod-name',  PRODUCT_NAME);
   await page.fill('#prod-price', String(PRODUCT_PRICE));
   await page.fill('#prod-qty',   '50');
@@ -67,29 +82,36 @@ test.beforeAll(async ({ browser }) => {
   await page.click('form button[type="submit"]:has-text("List Product")');
   await expect(page.locator(`text=${PRODUCT_NAME}`)).toBeVisible({ timeout: 10_000 });
 
-  // 3. Fetch the product id via API
+  // 3. Fetch the product id from the farmer's listing API
   const farmerToken = await apiLogin(page.request, FARMER_EMAIL, PASS);
   const prodRes = await page.request.get('/api/v1/products/mine/list', {
     headers: { Authorization: `Bearer ${farmerToken}` },
   });
   const { data: products } = await prodRes.json();
-  const product = products.find((p: any) => p.name === PRODUCT_NAME);
-  expect(product, 'seeded product must exist').toBeTruthy();
+  const product = (products as any[]).find((p: any) => p.name === PRODUCT_NAME);
+  expect(product, 'seeded product must exist in farmer listings').toBeTruthy();
   productId = product.id;
 
-  // 4. Create coupon for that farmer's product
+  // 4. Create the coupon via the API
+  //    Must fetch CSRF first — endpoint is /api/csrf-token, not /api/v1/csrf-token
   const csrf = await getCsrf(page.request);
   const couponRes = await page.request.post('/api/v1/coupons', {
-    headers: { Authorization: `Bearer ${farmerToken}`, 'x-csrf-token': csrf },
+    headers: {
+      Authorization: `Bearer ${farmerToken}`,
+      'x-csrf-token': csrf,
+    },
     data: {
       code:           COUPON_CODE,
       discount_type:  'percent',
       discount_value: DISCOUNT_PCT,
     },
   });
-  expect(couponRes.ok(), `coupon creation should succeed (got ${couponRes.status()})`).toBeTruthy();
+  expect(
+    couponRes.ok(),
+    `coupon creation should succeed (got ${couponRes.status()}: ${await couponRes.text()})`,
+  ).toBeTruthy();
 
-  // 5. Register buyer
+  // 5. Register the buyer via UI
   await page.goto('/register');
   await page.fill('#reg-name',     `Coupon Buyer ${ts}`);
   await page.fill('#reg-email',    BUYER_EMAIL);
@@ -101,11 +123,10 @@ test.beforeAll(async ({ browser }) => {
   await ctx.close();
 });
 
-// ─── tests ─────────────────────────────────────────────────────────────────
+// ─── tests ────────────────────────────────────────────────────────────────────
 
 test.describe('Coupon redemption (#1045)', () => {
   test.beforeEach(async ({ page }) => {
-    // Log in as buyer before each test
     await page.goto('/login');
     await page.fill('#login-email',    BUYER_EMAIL);
     await page.fill('#login-password', PASS);
@@ -115,30 +136,27 @@ test.describe('Coupon redemption (#1045)', () => {
 
   test('valid coupon shows discounted total and success message', async ({ page }) => {
     await page.goto(`/product/${productId}`);
-
-    // Wait for the product detail page to be fully rendered
     await expect(page.locator(`text=${PRODUCT_NAME}`)).toBeVisible({ timeout: 10_000 });
 
     // Coupon input is only rendered for buyers when stock > 0
     const couponInput = page.locator('input[placeholder="Coupon code"]');
     await expect(couponInput).toBeVisible({ timeout: 10_000 });
 
-    // Apply the valid coupon
     await couponInput.fill(COUPON_CODE);
     await page.click('button:has-text("Apply")');
 
-    // Success: inline confirmation
-    await expect(page.locator('text=✅ Coupon applied')).toBeVisible({ timeout: 10_000 });
+    // Success: inline confirmation rendered by the `{couponResult && …}` block
+    // The actual text is: "✅ Coupon applied — 20% off …"
+    await expect(page.locator('text=✅ Coupon applied').first()).toBeVisible({ timeout: 10_000 });
 
-    // Discounted total must be less than the original price
-    // The total section renders "Total: X XLM" — with a coupon it shows the
-    // struck-through original and the new total side by side.
-    // We verify by checking the page contains the expected discounted amount.
+    // Discounted total: PRODUCT_PRICE * (1 - DISCOUNT_PCT/100) formatted to 2 dp
     const expectedFinal = (PRODUCT_PRICE * (1 - DISCOUNT_PCT / 100)).toFixed(2);
     await expect(page.locator(`text=${expectedFinal} XLM`).first()).toBeVisible({ timeout: 5_000 });
 
-    // The original price must appear with a strikethrough (coupon applied state)
-    const strikethrough = page.locator('s, del, [style*="line-through"]').first();
+    // Original price must appear struck-through.
+    // ProductDetail.jsx applies `textDecoration: 'line-through'` as an inline
+    // style — not a <s> or <del> element.
+    const strikethrough = page.locator('[style*="line-through"]').first();
     await expect(strikethrough).toBeVisible();
   });
 
@@ -149,20 +167,19 @@ test.describe('Coupon redemption (#1045)', () => {
     const couponInput = page.locator('input[placeholder="Coupon code"]');
     await expect(couponInput).toBeVisible({ timeout: 10_000 });
 
-    // Enter a clearly bogus coupon code
     await couponInput.fill('NOTVALID99999');
     await page.click('button:has-text("Apply")');
 
-    // An error message must appear
-    await expect(page.locator('text=Invalid coupon code').or(
-      page.locator('[style*="color: rgb(192, 57, 43)"]')  // s.err colour
-    ).first()).toBeVisible({ timeout: 10_000 });
+    // The `couponError` state renders inside a div with s.err styling.
+    // The backend returns the message "Invalid coupon code" for unknown codes.
+    await expect(
+      page.locator('text=Invalid coupon code').first(),
+    ).toBeVisible({ timeout: 10_000 });
 
-    // ✅ banner must NOT appear
+    // Success banner must NOT be visible
     await expect(page.locator('text=✅ Coupon applied')).toHaveCount(0);
 
     // No strikethrough (discount not applied)
-    const strikethrough = page.locator('s, del, [style*="line-through"]');
-    await expect(strikethrough).toHaveCount(0);
+    await expect(page.locator('[style*="line-through"]')).toHaveCount(0);
   });
 });
