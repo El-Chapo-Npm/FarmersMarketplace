@@ -16,6 +16,7 @@ import FlashSaleCountdown from "../components/FlashSaleCountdown";
 import RecentlyCompared from "../components/RecentlyCompared";
 import Pagination from "../components/Pagination";
 import { useTranslation } from "react-i18next";
+import { buildSrcSet } from "../utils/imageUtils";
 
 const MapView = lazy(() => import("../components/MapView"));
 
@@ -764,7 +765,13 @@ export default function Marketplace() {
                   <div style={s.cardHeader}>
                     <div style={{ flex: 1 }}>
                       {p.image_url ? (
-                        <img src={p.image_url} alt={p.name} style={{ width: "100%", height: 140, objectFit: "cover", borderRadius: 8, marginBottom: 10 }} />
+                        <img
+                          src={p.image_url}
+                          srcSet={buildSrcSet(p.image_url)}
+                          sizes="(max-width: 600px) 100vw, (max-width: 900px) 50vw, 33vw"
+                          alt={p.name}
+                          style={{ width: "100%", height: 140, objectFit: "cover", borderRadius: 8, marginBottom: 10 }}
+                        />
                       ) : (
                         <div style={{ fontSize: 32, marginBottom: 8 }}>🥬</div>
                       )}
@@ -829,6 +836,8 @@ export default function Marketplace() {
                 {p.image_url ? (
                   <img
                     src={p.image_url}
+                    srcSet={buildSrcSet(p.image_url)}
+                    sizes="(max-width: 600px) 100vw, (max-width: 900px) 50vw, 33vw"
                     alt={p.name}
                     style={{
                       width: "100%",
@@ -1092,6 +1101,8 @@ export default function Marketplace() {
                     {p.image_url ? (
                       <img
                         src={p.image_url}
+                        srcSet={buildSrcSet(p.image_url)}
+                        sizes="(max-width: 600px) 100vw, (max-width: 900px) 50vw, 33vw"
                         alt={p.name}
                         style={{
                           width: "100%",
@@ -1432,6 +1443,8 @@ export default function Marketplace() {
                 {p.image_url && (
                   <img
                     src={p.image_url}
+                    srcSet={buildSrcSet(p.image_url)}
+                    sizes="(max-width: 600px) 50vw, 200px"
                     alt={p.name}
                     style={{ width: '100%', height: 120, objectFit: 'cover', borderRadius: 8, marginBottom: 12 }}
                   />
