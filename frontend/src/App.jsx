@@ -11,6 +11,7 @@ import Navbar from './components/Navbar';
 import AnnouncementBanner from './components/AnnouncementBanner';
 import LoadingSpinner from './components/LoadingSpinner';
 import PageLoader from './components/PageLoader';
+import UpdatePrompt from './components/UpdatePrompt';
 import { initSentry } from './utils/sentry';
 
 const LoginPage = lazy(() => import('./pages/Auth').then(m => ({ default: m.LoginPage })));
@@ -65,6 +66,7 @@ function AppContent() {
       <AnnouncementBanner />
       <Navbar />
       <LoadingSpinner />
+      <UpdatePrompt />
       <main id="main-content" style={{ paddingTop: 24 }}>
         <Suspense fallback={<PageLoader />}>
           <Routes>

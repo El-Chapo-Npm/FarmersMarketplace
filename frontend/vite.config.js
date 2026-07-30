@@ -1,6 +1,8 @@
+import { readFileSync } from 'fs';
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 
+const pkg = JSON.parse(readFileSync('./package.json', 'utf8'));
 // Bundle size budgets (kB, uncompressed).
 // Raise these deliberately and document the reason — do not bump silently.
 const INITIAL_CHUNK_BUDGET_KB = 500;   // vendor + index combined initial load
@@ -8,6 +10,9 @@ const TOTAL_BUNDLE_BUDGET_KB  = 5000;  // whole dist/assets directory
 
 export default defineConfig({
   plugins: [react()],
+  define: {
+    'self.__APP_VERSION__': JSON.stringify(pkg.version),
+  },
   build: {
     // Warn (and fail in CI via the check-bundle-size script) when any single
     // chunk exceeds this limit.
