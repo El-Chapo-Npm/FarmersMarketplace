@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useRef } from 'react';
+import { useTranslation } from 'react-i18next';
 
 const s = {
   wrap:    { display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6, marginTop: 24, flexWrap: 'wrap' },
@@ -15,6 +16,7 @@ const s = {
  */
 export default function Pagination({ page, totalPages, total, limit, onChange }) {
   const containerRef = useRef(null);
+  const { t } = useTranslation();
 
   if (!totalPages || totalPages <= 1) return null;
 
@@ -85,8 +87,8 @@ export default function Pagination({ page, totalPages, total, limit, onChange })
           Next ›
         </button>
 
-        <span style={s.info} aria-hidden="true">
-          {total} result{total !== 1 ? 's' : ''}
+        <span style={s.info} className="pagination-info" aria-hidden="true">
+          {t('pagination.resultCount', { count: total })}
         </span>
       </div>
     </nav>
