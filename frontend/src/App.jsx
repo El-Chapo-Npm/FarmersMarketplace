@@ -77,11 +77,18 @@ function AppContent() {
 
   return (
     <>
+      <a
+        href="#main-content"
+        className="skip-link"
+        onClick={() => document.getElementById('main-content')?.focus()}
+      >
+        Skip to main content
+      </a>
       <AnnouncementBanner />
       <Navbar />
       <LoadingSpinner />
       <UpdatePrompt />
-      <main id="main-content" style={{ paddingTop: 24 }}>
+      <main id="main-content" tabIndex={-1} style={{ paddingTop: 24, outline: 'none' }}>
         <Suspense fallback={<PageLoader />}>
           <Routes>
             <Route path="/" element={<Home />} />
