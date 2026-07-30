@@ -296,8 +296,7 @@ async function handleBundleOrder(req, res, bundle_id, address_id, coupon_code, u
  */
 const UUID_V4_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-router.post('/', auth, requireEmailVerified, validate.order, async (req, res) => {
-router.post('/', auth, orderRateLimit, validate.order, async (req, res) => {
+router.post('/', auth, requireEmailVerified, orderRateLimit, validate.order, async (req, res) => {
   if (req.user.role !== 'buyer') return err(res, 403, 'Only buyers can place orders', 'forbidden');
 
   const { product_id, quantity, address_id, coupon_code, use_soroban_escrow, custom_price, weight, source_asset, bundle_id, source_asset_code, source_asset_issuer, max_source_amount } = req.body;
@@ -777,13 +776,12 @@ router.patch('/:id/status', auth, validate.updateOrderStatus, async (req, res) =
   const { status } = req.body;
   const { rows } = await db.query(
     `SELECT o.*, p.name as product_name, p.unit, p.category, p.carbon_kg_per_unit,
-            u.name as buyer_name, u.email as buyer_email, f.stellar_public_key as farmer_wallet
+            u.name as buyer_name, u.email as buyer_email, u.stellar_public_key as buyer_stellar_address,
+            f.stellar_public_key as farmer_wallet
      FROM orders o
      JOIN products p ON o.product_id = p.id
      JOIN users u ON o.buyer_id = u.id
      JOIN users f ON p.farmer_id = f.id
-    `SELECT o.*, p.name as product_name, p.unit, u.name as buyer_name, u.email as buyer_email, u.stellar_public_key as buyer_stellar_address
-     FROM orders o JOIN products p ON o.product_id = p.id JOIN users u ON o.buyer_id = u.id
      WHERE o.id = $1 AND p.farmer_id = $2`,
     [req.params.id, req.user.id]
   );
