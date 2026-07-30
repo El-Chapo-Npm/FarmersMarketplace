@@ -1,5 +1,4 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import React, { useState, useEffect, useRef } from 'react';
 import { NavLink, useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { useTheme } from '../context/ThemeContext';
@@ -103,14 +102,9 @@ export default function Navbar() {
         to="/"
         end
         style={({ isActive }) => (isActive ? { ...s.brand, textDecoration: 'underline' } : s.brand)}
-        aria-current={undefined}
       >
         🌿 FarmersMarket
       </NavLink>
-    <nav style={s.nav} ref={navRef}>
-      <NavLink to="/" end style={({ isActive }) => (isActive ? s.activeLink : s.brand)}>🌿 FarmersMarket</NavLink>
-    <nav ref={navRef} style={s.nav}>
-      <Link to="/" style={s.brand}>🌿 FarmersMarket</Link>
       {network && (
         <span style={{
           background: network === 'mainnet' ? '#c0392b' : '#2d6a4f',
