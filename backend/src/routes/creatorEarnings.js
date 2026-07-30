@@ -5,8 +5,13 @@ const db = require('../db/schema');
 const config = require('../config');
 const { simulateContractCall, invokeContract } = require('../utils/stellar');
 const { err } = require('../middleware/error');
+const { getCachedResponse, cacheResponse } = require('../utils/idempotency');
+const logger = require('../logger');
 
 const STROOPS_PER_XLM = 10_000_000;
+
+// UUID v4 regex — same pattern used by the orders route
+const UUID_V4_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 /**
  * Loads the farmer account associated with a Stellar address and verifies it
@@ -173,6 +178,19 @@ router.get('/:address/lifetime', auth, async (req, res) => {
  *         required: true
  *         schema: { type: string }
  *         description: Stellar public key of the creator (farmer)
+ *     requestBody:
+ *       description: Idempotency key required to prevent duplicate on-chain submissions.
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *     headers:
+ *       X-Idempotency-Key:
+ *         description: UUID v4 used to deduplicate claim requests
+ *         required: true
+ *         schema:
+ *           type: string
  *     responses:
  *       200:
  *         description: Claim submitted and confirmed
@@ -184,18 +202,51 @@ router.get('/:address/lifetime', auth, async (req, res) => {
  *                 success: { type: boolean, example: true }
  *                 tx_hash: { type: string }
  *                 claimed_xlm: { type: number }
+ *       400:
+ *         description: Missing or invalid X-Idempotency-Key header
  *       403:
  *         description: Address does not belong to the authenticated caller
  *       404:
  *         description: No farmer account found for this address
  *       502:
  *         description: The claim transaction failed or could not be confirmed
+ *       503:
+ *         description: Idempotency cache temporarily unavailable
  */
 router.post('/:address/claim', auth, async (req, res) => {
   const { address } = req.params;
   if (!StellarSdk.StrKey.isValidEd25519PublicKey(address)) {
     return err(res, 400, 'Invalid Stellar address', 'invalid_address');
   }
+
+  // --- Idempotency enforcement (#1027) ---
+  const idempotencyKey = req.headers['x-idempotency-key'];
+  if (!idempotencyKey || !UUID_V4_RE.test(idempotencyKey)) {
+    return err(
+      res,
+      400,
+      'X-Idempotency-Key header must be a valid UUID v4',
+      'invalid_idempotency_key',
+    );
+  }
+
+  let cached;
+  try {
+    cached = await getCachedResponse(idempotencyKey);
+  } catch (cacheErr) {
+    logger.error('[creator-earnings] idempotency cache error', { error: cacheErr.message });
+    return res.status(503).json({
+      success: false,
+      error: 'Service temporarily unavailable',
+      code: 'idempotency_unavailable',
+    });
+  }
+
+  if (cached) {
+    const { _status, ...clientBody } = cached;
+    return res.status(_status || 200).json(clientBody);
+  }
+  // --- End idempotency enforcement ---
 
   const farmer = await requireOwnFarmerAccount(req, res, address);
   if (!farmer) return;
@@ -220,13 +271,22 @@ router.post('/:address/claim', auth, async (req, res) => {
       signerSecret: farmer.stellar_secret_key,
     });
 
-    res.json({
+    const responseBody = {
       success: true,
       tx_hash: hash,
       claimed_xlm: Number(result || 0) / STROOPS_PER_XLM,
-    });
+      _status: 200,
+    };
+
+    // Cache the successful response to deduplicate retries
+    await cacheResponse(idempotencyKey, responseBody, 86400);
+
+    // Remove internal _status before sending to client
+    const { _status, ...clientBody } = responseBody;
+    return res.status(_status).json(clientBody);
   } catch (error) {
-    err(res, 502, `Claim failed: ${error.message}`, 'claim_failed');
+    // Do NOT cache error responses — allow the client to retry with a fresh key
+    return err(res, 502, `Claim failed: ${error.message}`, 'claim_failed');
   }
 });
 

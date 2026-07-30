@@ -15,6 +15,7 @@ const auth = require('../middleware/auth');
 const { err } = require('../middleware/error');
 const logger = require('../logger');
 const { createPerIpRateLimiter } = require('../middleware/rateLimitPerUser');
+const { csrfTokenHandler, generateCsrfToken } = require('../middleware/csrf');
 
 const loginRateLimit = createPerIpRateLimiter(
   parseInt(process.env.RATE_LIMIT_LOGIN_MAX || '5', 10),

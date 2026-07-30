@@ -56,6 +56,8 @@ jest.mock('../src/utils/stellar', () => ({
   getContractWasmHash:    jest.fn().mockResolvedValue('0'.repeat(64)),
   simulateContractCall:   jest.fn(),
   invokeContract:         jest.fn(),
+  invokeEscrowContract:   jest.fn().mockResolvedValue({ txHash: 'ESCROW_TX' }),
+  burnRewardTokens:       jest.fn().mockResolvedValue({}),
   sendPayment: jest.fn().mockResolvedValue('TXHASH123'),
   createWallet: jest.fn(() => ({ publicKey: 'GPUBKEY', secretKey: 'SSECRET' })),
   getBalance: jest.fn().mockResolvedValue(1000),
@@ -120,6 +122,10 @@ jest.mock('../src/routes', () => {
   router.use('/api/notifications', require('../src/routes/notifications'));
   router.use('/api/creator-earnings', require('../src/routes/creatorEarnings'));
   router.use('/api/admin', require('../src/routes/admin'));
+  router.use('/api/admin', require('../src/routes/adminBan'));           // #1028 ban/unban audit
+  router.use('/api/admin/audit-log', require('../src/routes/adminAuditLog'));  // #1028 audit log endpoint
+  router.use('/api/admin/uploads', require('../src/routes/adminOrphanedUploads')); // #1025 orphaned uploads
+  router.use('/api/contracts', require('../src/routes/contracts'));       // #1028 contract simulate audit
   router.use('/api/calendar', require('../src/routes/calendar'));
   router.use('/api/batches', require('../src/routes/batches'));
   router.use('/api/network', require('../src/routes/network'));
@@ -209,6 +215,8 @@ beforeEach(() => {
   stellar.invokeContract = jest.fn();
   stellar.getContractWasmHash = jest.fn().mockResolvedValue('0'.repeat(64));
   stellar.getOrderBook?.mockResolvedValue({ bids: [], asks: [], base: 'XLM', counter: 'USDC' });
+  if (stellar.invokeEscrowContract) stellar.invokeEscrowContract.mockResolvedValue({ txHash: 'ESCROW_TX' });
+  if (stellar.burnRewardTokens) stellar.burnRewardTokens.mockResolvedValue({});
 
   const mailer = jest.requireMock('../src/utils/mailer');
   mailer.sendOrderEmails.mockResolvedValue({});
