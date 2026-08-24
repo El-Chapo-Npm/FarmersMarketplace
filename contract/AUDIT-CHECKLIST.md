@@ -5,7 +5,7 @@ Pre-mainnet gate for the marketplace's Soroban contracts. Covers `contract/src/l
 marketplace escrow), `contract/reward-token/src/lib.rs` (FRT token), and
 `contract/carbon-offset/src/lib.rs` (carbon offset certificates).
 
-Complements the dependency audit in [`SECURITY-AUDIT.md`](../SECURITY-AUDIT.md), which
+Complements the dependency audit in [`SECURITY-AUDIT.md`](../docs/implementation-notes/SECURITY-AUDIT.md), which
 covers `npm audit` findings only, not contract logic.
 
 ## 1. Integer overflow / underflow
