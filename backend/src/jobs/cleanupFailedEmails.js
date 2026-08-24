@@ -1,5 +1,6 @@
 const cron = require('node-cron');
 const db = require('../db/schema');
+const logger = require('../logger');
 
 /**
  * Cleanup failed emails older than the retention period
@@ -11,18 +12,18 @@ async function cleanupFailedEmails(retentionDays = 7) {
   cutoffDate.setDate(cutoffDate.getDate() - retentionDays);
   const cutoffIso = cutoffDate.toISOString();
 
-  console.log(`[cleanup-failed-emails] Pruning failed emails older than ${retentionDays} days (before ${cutoffIso})`);
+  logger.info(`[cleanup-failed-emails] Pruning failed emails older than ${retentionDays} days (before ${cutoffIso})`);
 
   const result = db.prepare(`
-    DELETE FROM failed_emails 
+    DELETE FROM failed_emails
     WHERE created_at < ?
   `).run(cutoffIso);
 
   const deletedCount = result.changes;
   if (deletedCount > 0) {
-    console.log(`[cleanup-failed-emails] Pruned ${deletedCount} old failed email record(s)`);
+    logger.info(`[cleanup-failed-emails] Pruned ${deletedCount} old failed email record(s)`);
   } else {
-    console.log(`[cleanup-failed-emails] No old failed email records to prune`);
+    logger.info(`[cleanup-failed-emails] No old failed email records to prune`);
   }
 
   return deletedCount;
@@ -33,15 +34,15 @@ async function cleanupFailedEmails(retentionDays = 7) {
  */
 function startFailedEmailCleanupJob() {
   const retentionDays = parseInt(process.env.FAILED_EMAIL_RETENTION_DAYS || '7', 10);
-  
+
   // Run daily at 2:00 AM to avoid peak usage
   cron.schedule('0 2 * * *', () => {
-    cleanupFailedEmails(retentionDays).catch(e => 
-      console.error('[cleanup-failed-emails] Job error:', e.message)
+    cleanupFailedEmails(retentionDays).catch(e =>
+      logger.error('[cleanup-failed-emails] Job error', { error: e.message })
     );
   });
-  
-  console.log(`[cleanup-failed-emails] Cleanup job scheduled (daily at 2:00 AM, ${retentionDays}-day retention)`);
+
+  logger.info(`[cleanup-failed-emails] Cleanup job scheduled (daily at 2:00 AM, ${retentionDays}-day retention)`);
 }
 
 module.exports = { startFailedEmailCleanupJob, cleanupFailedEmails };

@@ -11,6 +11,7 @@
 
 const db = require('../db/schema');
 const { server } = require('../utils/stellar');
+const logger = require('../logger');
 
 const LARGE_PAYMENT_THRESHOLD = 100; // XLM
 const FAILED_TX_THRESHOLD = 3;
@@ -82,7 +83,7 @@ async function runActivityMonitor() {
     );
     await Promise.allSettled(rows.map((u) => checkUser(u.id, u.stellar_public_key)));
   } catch (e) {
-    console.error('[activityMonitor] Error:', e.message);
+    logger.error('[activityMonitor] Error', { error: e.message });
   }
 }
 
