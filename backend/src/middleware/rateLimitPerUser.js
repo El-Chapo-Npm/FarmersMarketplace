@@ -22,6 +22,7 @@
  */
 
 const { err } = require('./error');
+const logger = require('../logger');
 
 // In-memory sliding-window store: key -> number[] (sorted timestamps)
 const memoryStore = new Map();
@@ -63,11 +64,11 @@ function getRedisClient() {
       enableOfflineQueue: false,
     });
     redisClient.on('error', (e) => {
-      console.debug('[ratelimit] Redis error, falling back to memory:', e.message);
+      logger.debug('[ratelimit] Redis error, falling back to memory', { error: e.message });
       redisClient = null;
     });
   } catch {
-    console.debug('[ratelimit] ioredis not available, using in-memory store');
+    logger.debug('[ratelimit] ioredis not available, using in-memory store');
   }
   return redisClient;
 }
@@ -130,7 +131,7 @@ async function slidingWindowCheck(key, maxRequests, windowMs) {
     try {
       return await redisSlide(client, key, maxRequests, windowMs);
     } catch (e) {
-      console.debug('[ratelimit] Redis eval failed, falling back to memory:', e.message);
+      logger.debug('[ratelimit] Redis eval failed, falling back to memory', { error: e.message });
     }
   }
   return memorySlide(key, maxRequests, windowMs);

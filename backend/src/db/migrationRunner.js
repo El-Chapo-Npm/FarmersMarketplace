@@ -14,6 +14,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const logger = require('../logger');
 
 const MIGRATIONS_DIR = path.join(__dirname, '../../migrations');
 
@@ -61,11 +62,11 @@ async function runMigrations(db) {
     await db.exec(sql);
     const p = db.placeholder ? db.placeholder(1) : '$1';
     await db.query(`INSERT INTO migrations (name) VALUES (${p})`, [file]);
-    console.log(`[migrate] Applied ${file}`);
+    logger.info(`[migrate] Applied ${file}`);
   }
 
   if (pending.length > 0) {
-    console.log(`[migrate] ${pending.length} migration(s) applied.`);
+    logger.info(`[migrate] ${pending.length} migration(s) applied.`);
   }
 }
 
