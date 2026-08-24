@@ -2,6 +2,7 @@ const StellarSdk = require('@stellar/stellar-sdk');
 const { recordContractInvocation } = require('../jobs/contractMonitor');
 const bip39 = require('bip39');
 const StellarHDWallet = require('stellar-hd-wallet');
+const logger = require('../logger');
 
 const STELLAR_NETWORK = (process.env.STELLAR_NETWORK || 'testnet').toLowerCase();
 
@@ -151,7 +152,7 @@ async function sendPayment({ senderSecret, receiverPublicKey, amount, memo }) {
 
   let txToSubmit = transaction;
   if (usedFeeBump) {
-    console.log(
+    logger.info(
       `[FeeBump] Buyer balance ${buyerBalance} XLM < threshold ${FEE_BUMP_THRESHOLD_XLM} XLM — wrapping with fee bump`
     );
     txToSubmit = await wrapWithFeeBump(transaction, feeAccountSecret);
@@ -160,7 +161,7 @@ async function sendPayment({ senderSecret, receiverPublicKey, amount, memo }) {
   const result = await server.submitTransaction(txToSubmit);
 
   if (usedFeeBump) {
-    console.log(
+    logger.info(
       `[FeeBump] Fee bump used for tx ${result.hash} — buyer: ${senderKeypair.publicKey()}`
     );
   }
@@ -857,13 +858,13 @@ async function resolveFederationAddress(address, db) {
 async function mintRewardTokens(buyerAddress, amount) {
   const contractId = process.env.REWARD_TOKEN_CONTRACT_ID;
   if (!contractId) {
-    console.warn('[Stellar] REWARD_TOKEN_CONTRACT_ID not set, skipping reward mint');
+    logger.warn('[Stellar] REWARD_TOKEN_CONTRACT_ID not set, skipping reward mint');
     return null;
   }
 
   const adminSecret = process.env.REWARD_TOKEN_ADMIN_SECRET;
   if (!adminSecret) {
-    console.warn('[Stellar] REWARD_TOKEN_ADMIN_SECRET not set, skipping reward mint');
+    logger.warn('[Stellar] REWARD_TOKEN_ADMIN_SECRET not set, skipping reward mint');
     return null;
   }
 
@@ -890,7 +891,7 @@ async function mintRewardTokens(buyerAddress, amount) {
     const result = await server.submitTransaction(transaction);
     return result.hash;
   } catch (error) {
-    console.error('[Stellar] Failed to mint reward tokens:', error.message);
+    logger.error('[Stellar] Failed to mint reward tokens', { error: error.message });
     return null;
   }
 }
@@ -1173,7 +1174,7 @@ async function getContractABI(contractId) {
     return functions;
   } catch (error) {
     if (error.code === 404) throw error;
-    console.error("[Stellar] Error fetching contract ABI:", error.message);
+    logger.error("[Stellar] Error fetching contract ABI", { error: error.message });
     return [];
   }
 }
