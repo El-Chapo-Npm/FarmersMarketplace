@@ -2,6 +2,7 @@
 // Kept separate from stellar.js so key-management code (stellar-accounts.js)
 // does not need to pull in the full payments/escrow module surface.
 const StellarSdk = require('@stellar/stellar-sdk');
+const logger = require('../logger');
 
 const STELLAR_NETWORK = (process.env.STELLAR_NETWORK || 'testnet').toLowerCase();
 
@@ -74,7 +75,7 @@ const OPTIONAL_STELLAR_VARS = ['REWARD_TOKEN_CONTRACT_ID', 'REWARD_TOKEN_ADMIN_S
  */
 function validateStellarConfig() {
   const network = isTestnet ? 'testnet' : 'mainnet';
-  console.log(`[stellar-config] Validating Stellar config for ${network} (${networkPassphrase})`);
+  logger.info(`[stellar-config] Validating Stellar config for ${network} (${networkPassphrase})`);
 
   const resolved = {
     SOROBAN_RPC_URL: sorobanRpcUrl, // always set (falls back to a network default)
@@ -92,7 +93,7 @@ function validateStellarConfig() {
 
   for (const name of OPTIONAL_STELLAR_VARS) {
     if (!process.env[name]) {
-      console.warn(`[stellar-config] Optional variable ${name} is not set; related features are disabled.`);
+      logger.warn(`[stellar-config] Optional variable ${name} is not set; related features are disabled.`);
     }
   }
 

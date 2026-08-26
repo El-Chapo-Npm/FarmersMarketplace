@@ -3,6 +3,7 @@ const router = express.Router();
 const rateLimit = require("express-rate-limit");
 const { verifyEmail, issueVerificationToken } = require("../services/emailVerificationService");
 const { sendVerificationEmail } = require("../services/emailService");
+const logger = require("../logger");
 
 const resendVerificationLimiter = rateLimit({
   windowMs: 60 * 60 * 1000, // 1 hour
@@ -21,7 +22,7 @@ router.get("/verify-email", async (req, res) => {
     if (!result.ok) return res.status(400).json({ error: result.error });
     res.json({ message: "Email verified successfully. You may now log in." });
   } catch (err) {
-    console.error("verify-email error:", err);
+    logger.error("verify-email error", { error: err.message, stack: err.stack });
     res.status(500).json({ error: "Internal server error." });
   }
 });
@@ -38,7 +39,7 @@ router.post("/resend-verification", resendVerificationLimiter, async (req, res) 
     await sendVerificationEmail(user.email, token);
     res.json({ message: "Verification email resent." });
   } catch (err) {
-    console.error("resend-verification error:", err);
+    logger.error("resend-verification error", { error: err.message, stack: err.stack });
     res.status(500).json({ error: "Internal server error." });
   }
 });

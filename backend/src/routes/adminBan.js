@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const requireAdmin = require("../middleware/requireAdmin");
 const { writeAuditLog } = require("../utils/auditLog");
+const logger = require("../logger");
 
 // POST /api/admin/users/:id/ban
 router.post("/users/:id/ban", requireAdmin, async (req, res) => {
@@ -28,7 +29,7 @@ router.post("/users/:id/ban", requireAdmin, async (req, res) => {
 
     res.json({ message: `User ${id} has been banned.`, banned_at: bannedAt, reason: reason || null });
   } catch (err) {
-    console.error("ban user error:", err);
+    logger.error("ban user error", { error: err.message, stack: err.stack });
     res.status(500).json({ error: "Internal server error." });
   }
 });
@@ -56,7 +57,7 @@ router.delete("/users/:id/ban", requireAdmin, async (req, res) => {
 
     res.json({ message: `User ${id} has been unbanned.` });
   } catch (err) {
-    console.error("unban user error:", err);
+    logger.error("unban user error", { error: err.message, stack: err.stack });
     res.status(500).json({ error: "Internal server error." });
   }
 });

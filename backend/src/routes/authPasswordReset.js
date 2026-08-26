@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const { createResetToken, consumeResetToken } = require("../services/passwordResetService");
 const { sendPasswordResetEmail } = require("../services/emailService");
+const logger = require("../logger");
 
 router.post("/forgot-password", async (req, res) => {
   try {
@@ -14,7 +15,7 @@ router.post("/forgot-password", async (req, res) => {
     }
     res.json({ message: "If that email is registered, a reset link has been sent." });
   } catch (err) {
-    console.error("forgot-password error:", err);
+    logger.error("forgot-password error", { error: err.message, stack: err.stack });
     res.status(500).json({ error: "Internal server error." });
   }
 });
@@ -30,7 +31,7 @@ router.post("/reset-password", async (req, res) => {
 
     res.json({ message: "Password updated successfully." });
   } catch (err) {
-    console.error("reset-password error:", err);
+    logger.error("reset-password error", { error: err.message, stack: err.stack });
     res.status(500).json({ error: "Internal server error." });
   }
 });

@@ -1,17 +1,24 @@
 const { cleanupFailedEmails, startFailedEmailCleanupJob } = require('../src/jobs/cleanupFailedEmails');
 const { mockDb } = require('./setup');
+const logger = require('../src/logger');
 
 // Mock node-cron
 jest.mock('node-cron', () => ({
   schedule: jest.fn(),
 }));
 
+// The job logs via logger.js (winston), not console — spy on the logger instead
+// of console so these assertions reflect what the code actually calls.
+jest.mock('../src/logger', () => ({
+  info: jest.fn(),
+  error: jest.fn(),
+  warn: jest.fn(),
+  debug: jest.fn(),
+}));
+
 describe('Failed Email Cleanup Job', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    // Reset console methods to avoid test output noise
-    jest.spyOn(console, 'log').mockImplementation(() => {});
-    jest.spyOn(console, 'error').mockImplementation(() => {});
   });
 
   afterEach(() => {
@@ -86,31 +93,27 @@ describe('Failed Email Cleanup Job', () => {
     });
 
     it('should log appropriate messages for cleanup results', async () => {
-      const consoleSpy = jest.spyOn(console, 'log');
-      
       // Test with deletions
       const mockRun = jest.fn().mockReturnValue({ changes: 5 });
       mockDb.prepare.mockReturnValue({ run: mockRun });
 
       await cleanupFailedEmails(7);
 
-      expect(consoleSpy).toHaveBeenCalledWith(
+      expect(logger.info).toHaveBeenCalledWith(
         expect.stringContaining('[cleanup-failed-emails] Pruning failed emails older than 7 days')
       );
-      expect(consoleSpy).toHaveBeenCalledWith(
+      expect(logger.info).toHaveBeenCalledWith(
         '[cleanup-failed-emails] Pruned 5 old failed email record(s)'
       );
     });
 
     it('should log when no records are pruned', async () => {
-      const consoleSpy = jest.spyOn(console, 'log');
-      
       const mockRun = jest.fn().mockReturnValue({ changes: 0 });
       mockDb.prepare.mockReturnValue({ run: mockRun });
 
       await cleanupFailedEmails(7);
 
-      expect(consoleSpy).toHaveBeenCalledWith(
+      expect(logger.info).toHaveBeenCalledWith(
         '[cleanup-failed-emails] No old failed email records to prune'
       );
     });
@@ -137,7 +140,7 @@ describe('Failed Email Cleanup Job', () => {
         expect.any(Function)
       );
 
-      expect(console.log).toHaveBeenCalledWith(
+      expect(logger.info).toHaveBeenCalledWith(
         '[cleanup-failed-emails] Cleanup job scheduled (daily at 2:00 AM, 7-day retention)'
       );
     });
@@ -153,7 +156,7 @@ describe('Failed Email Cleanup Job', () => {
         expect.any(Function)
       );
 
-      expect(console.log).toHaveBeenCalledWith(
+      expect(logger.info).toHaveBeenCalledWith(
         '[cleanup-failed-emails] Cleanup job scheduled (daily at 2:00 AM, 14-day retention)'
       );
 

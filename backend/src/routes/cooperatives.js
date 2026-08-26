@@ -16,6 +16,7 @@ const auth = require('../middleware/auth');
 const { err } = require('../middleware/error');
 const { createWallet, server, networkPassphrase } = require('../utils/stellar');
 const { encrypt, decrypt } = require('../utils/crypto');
+const logger = require('../logger');
 
 const MULTISIG_THRESHOLD_XLM = 50; // payments above this require multi-sig
 const TX_EXPIRY_HOURS = 24;
@@ -166,7 +167,7 @@ router.post('/:id/multisig-setup', auth, async (req, res) => {
     await server.submitTransaction(tx);
   } catch (e) {
     // If account not funded yet, just save the config — Stellar setup will happen when funded
-    console.warn('[multisig-setup] Stellar setup skipped (account may not be funded):', e.message);
+    logger.warn('[multisig-setup] Stellar setup skipped (account may not be funded)', { error: e.message });
   }
 
   // Save threshold

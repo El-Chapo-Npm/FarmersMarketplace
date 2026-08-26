@@ -1,6 +1,7 @@
 const config = require('../config');
 const { StellarSdk, isTestnet, server, networkPassphrase } = require('./stellar-config');
 const { getBalance } = require('./stellar-accounts');
+const logger = require('../logger');
 
 async function wrapWithFeeBump(innerTx, feeAccountSecret) {
   const feeKeypair = StellarSdk.Keypair.fromSecret(feeAccountSecret);
@@ -81,14 +82,13 @@ async function sendPayment({ senderSecret, receiverPublicKey, amount, memo, requ
   }
 
   const result = await server.submitTransaction(txToSubmit);
-  console.log(JSON.stringify({
+  logger.info('stellar_payment_submitted', {
     requestId: requestId || null,
-    event: 'stellar_payment_submitted',
     txHash: result.hash,
     from: senderKeypair.publicKey(),
     to: receiverPublicKey,
     amount,
-  }));
+  });
   return result.hash;
 }
 
@@ -320,12 +320,12 @@ async function createPreorderClaimableBalance({ senderSecret, farmerPublicKey, a
 async function mintRewardTokens(buyerAddress, amount) {
   const contractId = config.rewardTokenContractId;
   if (!contractId) {
-    console.warn('[Stellar] REWARD_TOKEN_CONTRACT_ID not set, skipping reward mint');
+    logger.warn('[Stellar] REWARD_TOKEN_CONTRACT_ID not set, skipping reward mint');
     return null;
   }
   const adminSecret = config.rewardTokenAdminSecret;
   if (!adminSecret) {
-    console.warn('[Stellar] REWARD_TOKEN_ADMIN_SECRET not set, skipping reward mint');
+    logger.warn('[Stellar] REWARD_TOKEN_ADMIN_SECRET not set, skipping reward mint');
     return null;
   }
   try {
@@ -346,7 +346,7 @@ async function mintRewardTokens(buyerAddress, amount) {
     const result = await server.submitTransaction(transaction);
     return result.hash;
   } catch (error) {
-    console.error('[Stellar] Failed to mint reward tokens:', error.message);
+    logger.error('[Stellar] Failed to mint reward tokens', { error: error.message });
     return null;
   }
 }
@@ -362,12 +362,12 @@ async function mintRewardTokens(buyerAddress, amount) {
 async function burnRewardTokens(buyerAddress, amount) {
   const contractId = config.rewardTokenContractId;
   if (!contractId) {
-    console.warn('[Stellar] REWARD_TOKEN_CONTRACT_ID not set, skipping reward burn');
+    logger.warn('[Stellar] REWARD_TOKEN_CONTRACT_ID not set, skipping reward burn');
     return null;
   }
   const adminSecret = config.rewardTokenAdminSecret;
   if (!adminSecret) {
-    console.warn('[Stellar] REWARD_TOKEN_ADMIN_SECRET not set, skipping reward burn');
+    logger.warn('[Stellar] REWARD_TOKEN_ADMIN_SECRET not set, skipping reward burn');
     return null;
   }
   try {
@@ -388,7 +388,7 @@ async function burnRewardTokens(buyerAddress, amount) {
     const result = await server.submitTransaction(transaction);
     return result.hash;
   } catch (error) {
-    console.warn('[Stellar] Failed to burn reward tokens (non-fatal):', error.message);
+    logger.warn('[Stellar] Failed to burn reward tokens (non-fatal)', { error: error.message });
     return null;
   }
 }
