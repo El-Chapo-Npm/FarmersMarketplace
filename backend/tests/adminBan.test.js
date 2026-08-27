@@ -10,8 +10,11 @@
  *    rejects freshly-banned users with 403 (session rejection)
  */
 
+jest.mock('../src/db/schema', () => ({ query: jest.fn() }));
+
 const express = require('express');
 const supertest = require('supertest');
+const db = require('../src/db/schema');
 const adminBanRouter = require('../src/routes/adminBan');
 const requireNotBanned = require('../src/middleware/requireNotBanned');
 
@@ -26,17 +29,11 @@ function buildApp({ user, userRow, updateResult } = {}) {
     next();
   });
 
-  // Inject knex-style db mock
-  app.use((req, _res, next) => {
-    const updateMock = jest.fn().mockResolvedValue(updateResult !== undefined ? updateResult : 1);
-    const whereMock = jest.fn().mockReturnValue({
-      first: jest.fn().mockResolvedValue(userRow),
-      update: updateMock,
-    });
-    req.db = jest.fn(() => ({ where: whereMock }));
-    req.db._where = whereMock;
-    req.db._update = updateMock;
-    next();
+  db.query.mockImplementation(async (sql) => {
+    if (/^\s*SELECT/i.test(sql)) {
+      return { rows: userRow ? [userRow] : [], rowCount: userRow ? 1 : 0 };
+    }
+    return { rows: [], rowCount: updateResult !== undefined ? updateResult : 1 };
   });
 
   app.use('/', adminBanRouter);

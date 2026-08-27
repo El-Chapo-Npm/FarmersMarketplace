@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const requireAdmin = require("../middleware/requireAdmin");
 const { writeAuditLog } = require("../utils/auditLog");
+const db = require("../db/schema");
 const logger = require("../logger");
 
 // POST /api/admin/users/:id/ban
@@ -9,15 +10,21 @@ router.post("/users/:id/ban", requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const { reason } = req.body;
-    const user = await req.db("users").where({ id }).first();
+    const { rows } = await db.query(
+      `SELECT id, role, banned_at, ban_reason FROM users WHERE id = $1 LIMIT 1`,
+      [id]
+    );
+    const user = rows[0];
     if (!user) return res.status(404).json({ error: "User not found." });
     if (user.role === "admin") return res.status(400).json({ error: "Cannot ban an admin account." });
     if (user.banned_at) return res.status(409).json({ error: "User is already banned." });
 
     const bannedAt = new Date();
-    await req.db("users").where({ id }).update({ banned_at: bannedAt, ban_reason: reason || null });
+    await db.query(
+      `UPDATE users SET banned_at = $1, ban_reason = $2 WHERE id = $3`,
+      [bannedAt, reason || null, id]
+    );
 
-    // Audit log — non-fatal
     await writeAuditLog({
       adminId: req.user.id,
       action: "ban_user",
@@ -38,20 +45,22 @@ router.post("/users/:id/ban", requireAdmin, async (req, res) => {
 router.delete("/users/:id/ban", requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-    const user = await req.db("users").where({ id }).first();
+    const { rows } = await db.query(
+      `SELECT id, banned_at, ban_reason FROM users WHERE id = $1 LIMIT 1`,
+      [id]
+    );
+    const user = rows[0];
     if (!user) return res.status(404).json({ error: "User not found." });
     if (!user.banned_at) return res.status(409).json({ error: "User is not banned." });
 
-    const prevBannedAt = user.banned_at;
-    await req.db("users").where({ id }).update({ banned_at: null, ban_reason: null });
+    await db.query(`UPDATE users SET banned_at = NULL, ban_reason = NULL WHERE id = $1`, [id]);
 
-    // Audit log — non-fatal
     await writeAuditLog({
       adminId: req.user.id,
       action: "unban_user",
       targetType: "user",
       targetId: id,
-      before: { banned_at: prevBannedAt, ban_reason: user.ban_reason || null },
+      before: { banned_at: user.banned_at, ban_reason: user.ban_reason || null },
       after: { banned_at: null, ban_reason: null },
     });
 
