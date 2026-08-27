@@ -20,11 +20,6 @@ const { sendPasswordResetEmail } = require('../src/services/emailService');
 function buildApp() {
   const app = express();
   app.use(express.json());
-  // req.db not used directly by the route (passed through to service), stub it
-  app.use((req, _res, next) => {
-    req.db = {};
-    next();
-  });
   app.use('/', passwordResetRouter);
   return app;
 }
@@ -60,10 +55,10 @@ describe('POST /forgot-password', () => {
     expect(sendPasswordResetEmail).toHaveBeenCalledWith('user@test.com', 'resettoken123');
   });
 
-  it('calls createResetToken with the db and email', async () => {
+  it('calls createResetToken with the email', async () => {
     createResetToken.mockResolvedValue(null);
     await supertest(buildApp()).post('/forgot-password').send({ email: 'a@b.com' });
-    expect(createResetToken).toHaveBeenCalledWith(expect.anything(), 'a@b.com');
+    expect(createResetToken).toHaveBeenCalledWith('a@b.com');
   });
 });
 
@@ -118,6 +113,6 @@ describe('POST /reset-password', () => {
   it('calls consumeResetToken with the token and new password', async () => {
     consumeResetToken.mockResolvedValue({ ok: true });
     await supertest(buildApp()).post('/reset-password').send({ token: 'tok123', password: 'SecurePass1!' });
-    expect(consumeResetToken).toHaveBeenCalledWith(expect.anything(), 'tok123', 'SecurePass1!');
+    expect(consumeResetToken).toHaveBeenCalledWith('tok123', 'SecurePass1!');
   });
 });
